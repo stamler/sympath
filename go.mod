@@ -1,4 +1,4 @@
-module async_file_sync
+module sympath
 
 go 1.25.2
 

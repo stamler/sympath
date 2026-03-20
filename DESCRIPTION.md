@@ -1,8 +1,8 @@
-# async_file_sync - Directory Inventory & One-Way Sync Index
+# sympath - Directory Inventory & One-Way Sync Index
 
 ## Overview
 
-`async_file_sync` is a cross-platform Go library that inventories a directory
+`sympath` is a cross-platform Go library that inventories a directory
 tree and stores file metadata and content hashes in SQLite. It is designed as
 the foundation for a high-performance, asynchronous, one-way sync tool in the
 spirit of rsync.
@@ -12,6 +12,21 @@ The library exposes a single public function:
 ```go
 func InventoryTree(ctx context.Context, db *sql.DB, root string) error
 ```
+
+It also now includes a basic CLI:
+
+```bash
+go run ./cmd/sympath scan /path/to/root
+```
+
+or, equivalently:
+
+```bash
+go run ./cmd/sympath /path/to/root
+```
+
+By default the CLI stores its SQLite database at `~/.sympath/inventory.sympath`.
+You can override that with `--db`.
 
 Each call produces a complete snapshot of every regular file under `root`.
 Subsequent calls reuse hashes from the previous snapshot when a file's size

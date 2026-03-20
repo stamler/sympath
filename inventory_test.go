@@ -13,7 +13,7 @@ import (
 
 func openTestDB(t *testing.T, dir string) *sql.DB {
 	t.Helper()
-	dbPath := filepath.Join(dir, ".inventory.sqlite")
+	dbPath := filepath.Join(dir, "inventory.sympath")
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -340,7 +340,7 @@ func TestInventoryTree_UnicodeFilenames(t *testing.T) {
 
 	createTestTree(t, scanDir, map[string]string{
 		"日本語.txt":     "japanese",
-		"café.txt":     "french",
+		"café.txt":    "french",
 		"data/🎉.json": `{"party": true}`,
 	})
 
@@ -390,7 +390,7 @@ func TestInventoryTree_DBFileExcluded(t *testing.T) {
 	})
 
 	// Put the DB inside the scan directory
-	dbPath := filepath.Join(scanDir, ".inventory.sqlite")
+	dbPath := filepath.Join(scanDir, "inventory.sympath")
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
