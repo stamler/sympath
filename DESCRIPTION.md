@@ -25,8 +25,12 @@ or, equivalently:
 go run ./cmd/sympath /path/to/root
 ```
 
-By default the CLI stores its SQLite database at `~/.sympath/inventory.sympath`.
-You can override that with `--db`.
+On each run, the CLI consolidates all `~/.sympath/*.sympath` files into
+one surviving database file and then scans into that file. If the
+directory is empty, it creates a new random 10-character alphanumeric
+`.sympath` filename with `NewRandomSympathFilename()`. Pass `--verbose`
+to print startup messages about directory creation, consolidation, and
+the final database path in use.
 
 Each call produces a complete snapshot of every regular file under `root`.
 Subsequent calls reuse hashes from the previous snapshot when a file's size
