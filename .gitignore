@@ -1,3 +1,5 @@
 cmd/sympath
 file_times.chatlog
 .claude/settings.local.json
+.gocache/
+dist/
