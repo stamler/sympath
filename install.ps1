@@ -54,6 +54,22 @@ function Get-ExpectedChecksum([string]$ChecksumsPath, [string]$AssetName) {
     Fail "no checksum found for $AssetName"
 }
 
+function Get-SHA256Hex([string]$Path) {
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $hashBytes = $sha256.ComputeHash($stream)
+        } finally {
+            $sha256.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+
+    return ([System.BitConverter]::ToString($hashBytes)).Replace('-', '').ToLowerInvariant()
+}
+
 function Prepend-PathEntry([string]$PathValue, [string]$Entry) {
     $parts = New-Object System.Collections.Generic.List[string]
     foreach ($part in ($PathValue -split ';')) {
@@ -114,7 +130,7 @@ function Main() {
         Fetch-Asset -AssetName 'checksums.txt' -DestinationPath $checksumsPath
 
         $expected = Get-ExpectedChecksum -ChecksumsPath $checksumsPath -AssetName $assetName
-        $actual = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $actual = Get-SHA256Hex -Path $archivePath
         if ($actual -ne $expected.ToLowerInvariant()) {
             Fail "checksum verification failed for $assetName"
         }
