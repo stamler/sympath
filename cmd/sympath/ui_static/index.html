@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sympath</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f5f5f5; color: #222; }
+
+header { background: #1a1a2e; color: #eee; padding: 12px 24px; display: flex; align-items: center; gap: 16px; }
+header h1 { font-size: 18px; font-weight: 600; }
+
+.selectors { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px 24px; background: #fff; border-bottom: 1px solid #ddd; }
+.selector-col label { display: block; font-size: 12px; font-weight: 600; text-transform: uppercase; color: #666; margin-bottom: 4px; }
+.selector-col select { width: 100%; padding: 8px; font-size: 14px; border: 1px solid #ccc; border-radius: 4px; background: #fff; margin-bottom: 8px; }
+
+.ac-wrap { position: relative; }
+.ac-wrap input {
+  width: 100%; padding: 8px; font-size: 14px; border: 1px solid #ccc; border-radius: 4px;
+  font-family: "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  background: transparent; position: relative; z-index: 1;
+}
+.ac-wrap input:disabled { background: #f5f5f5; color: #aaa; }
+.ac-wrap input:focus::placeholder { color: transparent; }
+.ac-wrap .ghost {
+  position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+  padding: 8px; font-size: 14px;
+  font-family: "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  color: #bbb; pointer-events: none; white-space: nowrap; overflow: hidden;
+  z-index: 0;
+}
+.ac-list {
+  display: none; position: absolute; top: 100%; left: 0; right: 0; z-index: 10;
+  background: #fff; border: 1px solid #ccc; border-top: none; border-radius: 0 0 4px 4px;
+  max-height: 240px; overflow-y: auto;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+.ac-list.open { display: block; }
+.ac-item {
+  padding: 6px 8px; font-size: 13px; cursor: pointer;
+  font-family: "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+}
+.ac-item:hover { background: #f0f0f0; }
+.ac-item.active { background: #e3f2fd; }
+.ac-item .match { font-weight: 700; }
+
+.summary { padding: 12px 24px; background: #eef6ee; border-bottom: 1px solid #cde6cd; font-size: 14px; color: #2a6e2a; text-align: center; display: none; }
+
+.results { padding: 16px 24px; }
+.results.empty { text-align: center; color: #888; padding: 48px 24px; font-size: 14px; }
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; padding: 6px 8px; background: #f0f0f0; border-bottom: 2px solid #ddd; font-size: 11px; text-transform: uppercase; color: #666; }
+td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; font-family: "SF Mono", SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+
+.section-heading { padding: 10px 8px 4px; font-size: 12px; font-weight: 600; text-transform: uppercase; color: #888; }
+
+.left-only td.left { background: #fff3e0; }
+.left-only td.right { color: #ccc; }
+.right-only td.right { background: #e3f2fd; }
+.right-only td.left { color: #ccc; }
+
+.diff td { background: #fff8f8; }
+.diff .changed { color: #c62828; font-weight: 600; }
+
+.size { text-align: right; white-space: nowrap; }
+.sha { color: #666; max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
+
+.options { padding: 8px 24px; background: #fff; border-bottom: 1px solid #ddd; display: flex; align-items: center; gap: 8px; }
+.options label { font-size: 13px; color: #444; cursor: pointer; display: flex; align-items: center; gap: 4px; }
+.options input[type="checkbox"] { margin: 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>sympath</h1>
+</header>
+
+<div class="selectors">
+  <div class="selector-col">
+    <label>Left</label>
+    <select id="left-root"><option value="">Select a root...</option></select>
+    <div class="ac-wrap">
+      <span class="ghost" id="left-ghost"></span>
+      <input type="text" id="left-dir" placeholder="(entire root)" disabled autocomplete="off">
+      <div class="ac-list" id="left-list"></div>
+    </div>
+  </div>
+  <div class="selector-col">
+    <label>Right</label>
+    <select id="right-root"><option value="">Select a root...</option></select>
+    <div class="ac-wrap">
+      <span class="ghost" id="right-ghost"></span>
+      <input type="text" id="right-dir" placeholder="(entire root)" disabled autocomplete="off">
+      <div class="ac-list" id="right-list"></div>
+    </div>
+  </div>
+</div>
+
+<div class="options">
+  <label><input type="checkbox" id="by-content"> Match by content (ignore path)</label>
+</div>
+
+<div class="summary" id="summary"></div>
+
+<div class="results empty" id="results">
+  Select a root on each side to compare.
+</div>
+
+<script>
+const leftRootSel = document.getElementById('left-root');
+const rightRootSel = document.getElementById('right-root');
+const byContentBox = document.getElementById('by-content');
+const summaryEl = document.getElementById('summary');
+const resultsEl = document.getElementById('results');
+
+let roots = [];
+const dirsCache = {};
+
+async function init() {
+  try {
+    const resp = await fetch('/api/roots');
+    roots = await resp.json();
+  } catch (e) {
+    resultsEl.textContent = 'Failed to load roots: ' + e.message;
+    return;
+  }
+  const placeholder = '<option value="">Select a root...</option>';
+  const opts = roots.map((r, i) =>
+    `<option value="${i}">${esc(r.hostname)}: ${esc(r.root)}</option>`
+  ).join('');
+  leftRootSel.innerHTML = placeholder + opts;
+  rightRootSel.innerHTML = placeholder + opts;
+}
+
+async function fetchDirs(rootIdx) {
+  if (rootIdx === '') return [];
+  const r = roots[parseInt(rootIdx)];
+  const key = r.machine_id + '|' + r.root;
+  if (dirsCache[key]) return dirsCache[key];
+  try {
+    const params = new URLSearchParams({ machine_id: r.machine_id, root: r.root });
+    const resp = await fetch('/api/dirs?' + params);
+    if (!resp.ok) return [];
+    const dirs = await resp.json();
+    dirsCache[key] = dirs;
+    return dirs;
+  } catch (e) { return []; }
+}
+
+// --- Autocomplete component ---
+
+function createAutocomplete(rootSel, inputId, ghostId, listId) {
+  const input = document.getElementById(inputId);
+  const ghost = document.getElementById(ghostId);
+  const list = document.getElementById(listId);
+  let dirs = [];
+  let matches = [];
+  let activeIdx = -1; // -1 = none highlighted, input value is authoritative
+
+  rootSel.addEventListener('change', async () => {
+    input.value = '';
+    ghost.textContent = '';
+    closeList();
+    if (rootSel.value === '') {
+      input.disabled = true;
+      input.placeholder = '(entire root)';
+      dirs = [];
+    } else {
+      dirs = await fetchDirs(rootSel.value);
+      if (dirs.length === 0) {
+        input.disabled = true;
+        input.placeholder = '(no subdirectories)';
+      } else {
+        input.disabled = false;
+        input.placeholder = 'type to filter, Tab to complete';
+      }
+    }
+    compare();
+  });
+
+  function getMatches(v) {
+    if (!v) return dirs.slice(0, 50); // show top dirs when focused with empty input
+    const vl = v.toLowerCase();
+    return dirs.filter(d => d.toLowerCase().startsWith(vl));
+  }
+
+  function getCompletion(v) {
+    if (!v) return '';
+    const vl = v.toLowerCase();
+    const m = dirs.filter(d => d.toLowerCase().startsWith(vl));
+    if (m.length === 0) return '';
+    return m[0];
+  }
+
+  // Tab-complete: longest common prefix snapped to next / boundary.
+  function tabComplete(v) {
+    if (!v) {
+      // If nothing typed but there's a ghost, complete to first segment.
+      if (matches.length > 0) {
+        const first = matches[0];
+        const slash = first.indexOf('/');
+        return slash !== -1 ? first.substring(0, slash + 1) : first + '/';
+      }
+      return null;
+    }
+    const vl = v.toLowerCase();
+    const m = dirs.filter(d => d.toLowerCase().startsWith(vl));
+    if (m.length === 0) return null;
+
+    // LCP of all matches.
+    let lcp = m[0];
+    for (let i = 1; i < m.length; i++) {
+      let j = 0;
+      while (j < lcp.length && j < m[i].length && lcp[j] === m[i][j]) j++;
+      lcp = lcp.substring(0, j);
+    }
+    if (lcp.length > v.length) {
+      const slash = lcp.indexOf('/', v.length);
+      if (slash !== -1) return lcp.substring(0, slash + 1);
+      if (m.length === 1) return lcp + '/';
+      return lcp;
+    }
+    if (m.length === 1 && v === m[0]) return v + '/';
+    return null;
+  }
+
+  function renderList() {
+    if (matches.length === 0) { closeList(); return; }
+    let html = '';
+    const v = input.value;
+    const vLen = v.length;
+    for (let i = 0; i < matches.length; i++) {
+      const d = matches[i];
+      const cls = i === activeIdx ? 'ac-item active' : 'ac-item';
+      // Bold the matched prefix.
+      const matchPart = esc(d.substring(0, vLen));
+      const rest = esc(d.substring(vLen));
+      html += `<div class="${cls}" data-idx="${i}"><span class="match">${matchPart}</span>${rest}</div>`;
+    }
+    list.innerHTML = html;
+    list.classList.add('open');
+
+    // Scroll active into view.
+    if (activeIdx >= 0) {
+      const el = list.children[activeIdx];
+      if (el) el.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function closeList() {
+    list.classList.remove('open');
+    list.innerHTML = '';
+    matches = [];
+    activeIdx = -1;
+  }
+
+  function acceptValue(v) {
+    input.value = v;
+    ghost.textContent = '';
+    closeList();
+    scheduleCompare();
+  }
+
+  function updateGhost() {
+    if (activeIdx >= 0) {
+      ghost.textContent = matches[activeIdx] || '';
+    } else {
+      ghost.textContent = getCompletion(input.value);
+    }
+  }
+
+  input.addEventListener('focus', () => {
+    matches = getMatches(input.value);
+    activeIdx = -1;
+    renderList();
+    updateGhost();
+  });
+
+  input.addEventListener('input', () => {
+    matches = getMatches(input.value);
+    activeIdx = -1;
+    renderList();
+    updateGhost();
+    scheduleCompare();
+  });
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      // If an item is highlighted, accept it.
+      if (activeIdx >= 0 && matches[activeIdx]) {
+        acceptValue(matches[activeIdx] + '/');
+        return;
+      }
+      // Otherwise tab-complete.
+      const completed = tabComplete(input.value);
+      if (completed !== null && completed !== input.value) {
+        input.value = completed;
+        matches = getMatches(input.value);
+        activeIdx = -1;
+        renderList();
+        updateGhost();
+        scheduleCompare();
+      }
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (matches.length === 0) return;
+      activeIdx = activeIdx < matches.length - 1 ? activeIdx + 1 : 0;
+      renderList();
+      updateGhost();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (matches.length === 0) return;
+      activeIdx = activeIdx > 0 ? activeIdx - 1 : matches.length - 1;
+      renderList();
+      updateGhost();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (activeIdx >= 0 && matches[activeIdx]) {
+        acceptValue(matches[activeIdx] + '/');
+      } else {
+        closeList();
+        compare();
+      }
+    } else if (e.key === 'Escape') {
+      if (list.classList.contains('open')) {
+        e.preventDefault();
+        closeList();
+        ghost.textContent = getCompletion(input.value);
+      } else {
+        input.value = '';
+        ghost.textContent = '';
+        compare();
+      }
+    }
+  });
+
+  input.addEventListener('blur', () => {
+    // Delay so click on list item registers.
+    setTimeout(() => {
+      closeList();
+      ghost.textContent = getCompletion(input.value);
+    }, 150);
+  });
+
+  list.addEventListener('mousedown', (e) => {
+    // Prevent blur from firing before click.
+    e.preventDefault();
+  });
+
+  list.addEventListener('click', (e) => {
+    const item = e.target.closest('.ac-item');
+    if (!item) return;
+    const idx = parseInt(item.dataset.idx);
+    if (matches[idx] !== undefined) {
+      acceptValue(matches[idx] + '/');
+      input.focus();
+    }
+  });
+
+  return { input, dirs: () => dirs };
+}
+
+const leftAc = createAutocomplete(leftRootSel, 'left-dir', 'left-ghost', 'left-list');
+const rightAc = createAutocomplete(rightRootSel, 'right-dir', 'right-ghost', 'right-list');
+
+byContentBox.addEventListener('change', compare);
+
+// --- Compare logic ---
+
+let compareTimer = null;
+function scheduleCompare() {
+  clearTimeout(compareTimer);
+  compareTimer = setTimeout(compare, 400);
+}
+
+async function compare() {
+  clearTimeout(compareTimer);
+  const li = leftRootSel.value;
+  const ri = rightRootSel.value;
+  if (li === '' || ri === '') {
+    summaryEl.style.display = 'none';
+    resultsEl.className = 'results empty';
+    resultsEl.textContent = 'Select a root on each side to compare.';
+    return;
+  }
+
+  const left = roots[parseInt(li)];
+  const right = roots[parseInt(ri)];
+
+  resultsEl.className = 'results empty';
+  resultsEl.textContent = 'Comparing...';
+  summaryEl.style.display = 'none';
+
+  try {
+    const params = new URLSearchParams({
+      left_machine: left.machine_id,
+      left_root: left.root,
+      right_machine: right.machine_id,
+      right_root: right.root,
+    });
+    const lp = leftAc.input.value.replace(/\/+$/, '');
+    const rp = rightAc.input.value.replace(/\/+$/, '');
+    if (lp) params.set('left_prefix', lp);
+    if (rp) params.set('right_prefix', rp);
+    if (byContentBox.checked) params.set('by_content', '1');
+
+    const resp = await fetch('/api/compare?' + params);
+    if (!resp.ok) {
+      resultsEl.textContent = 'Error: ' + await resp.text();
+      return;
+    }
+    const data = await resp.json();
+    render(data);
+  } catch (e) {
+    resultsEl.textContent = 'Request failed: ' + e.message;
+  }
+}
+
+function render(data) {
+  const total = data.identical_count + data.left_only.length + data.right_only.length + data.different.length;
+
+  summaryEl.textContent = `${data.identical_count.toLocaleString()} identical files out of ${total.toLocaleString()} total`;
+  summaryEl.style.display = 'block';
+
+  if (data.left_only.length === 0 && data.right_only.length === 0 && data.different.length === 0) {
+    resultsEl.className = 'results empty';
+    resultsEl.textContent = 'All files are identical.';
+    return;
+  }
+
+  resultsEl.className = 'results';
+  let html = '<table>';
+  html += '<tr><th>Left path</th><th class="size">Left size</th><th>Left SHA-256</th>';
+  html += '<th>Right path</th><th class="size">Right size</th><th>Right SHA-256</th></tr>';
+
+  if (data.different.length > 0) {
+    html += `<tr><td colspan="6" class="section-heading">Different (${data.different.length})</td></tr>`;
+    for (const d of data.different) {
+      const sizeChanged = d.left.size !== d.right.size;
+      const shaChanged = d.left.sha256 !== d.right.sha256;
+      html += `<tr class="diff">`;
+      html += `<td class="left">${esc(d.rel_path)}</td>`;
+      html += `<td class="left size ${sizeChanged ? 'changed' : ''}">${fmtSize(d.left.size)}</td>`;
+      html += `<td class="left sha ${shaChanged ? 'changed' : ''}">${shortSha(d.left.sha256)}</td>`;
+      html += `<td class="right">${esc(d.rel_path)}</td>`;
+      html += `<td class="right size ${sizeChanged ? 'changed' : ''}">${fmtSize(d.right.size)}</td>`;
+      html += `<td class="right sha ${shaChanged ? 'changed' : ''}">${shortSha(d.right.sha256)}</td>`;
+      html += `</tr>`;
+    }
+  }
+
+  if (data.left_only.length > 0) {
+    html += `<tr><td colspan="6" class="section-heading">Left only (${data.left_only.length})</td></tr>`;
+    for (const f of data.left_only) {
+      html += `<tr class="left-only">`;
+      html += `<td class="left">${esc(f.rel_path)}</td>`;
+      html += `<td class="left size">${fmtSize(f.size)}</td>`;
+      html += `<td class="left sha">${shortSha(f.sha256)}</td>`;
+      html += `<td class="right"></td><td class="right"></td><td class="right"></td>`;
+      html += `</tr>`;
+    }
+  }
+
+  if (data.right_only.length > 0) {
+    html += `<tr><td colspan="6" class="section-heading">Right only (${data.right_only.length})</td></tr>`;
+    for (const f of data.right_only) {
+      html += `<tr class="right-only">`;
+      html += `<td class="left"></td><td class="left"></td><td class="left"></td>`;
+      html += `<td class="right">${esc(f.rel_path)}</td>`;
+      html += `<td class="right size">${fmtSize(f.size)}</td>`;
+      html += `<td class="right sha">${shortSha(f.sha256)}</td>`;
+      html += `</tr>`;
+    }
+  }
+
+  html += '</table>';
+  resultsEl.innerHTML = html;
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function fmtSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+}
+
+function shortSha(s) {
+  if (!s || s.length < 12) return s || '';
+  return s.substring(0, 12) + '...';
+}
+
+init();
+</script>
+</body>
+</html>

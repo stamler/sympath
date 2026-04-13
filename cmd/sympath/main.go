@@ -62,6 +62,8 @@ func runWithIO(args []string, stdout, stderr io.Writer) error {
 		return nil
 	case "scan":
 		return runScanWithIO(args[1:], stdout, stderr)
+	case "ui":
+		return runUIWithIO(args[1:], stdout, stderr)
 	default:
 		return runScanWithIO(args, stdout, stderr)
 	}
@@ -135,11 +137,14 @@ func runScanWithIO(args []string, stdout, stderr io.Writer) error {
 func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "Usage:\n")
 	fmt.Fprintf(w, "  sympath scan [--verbose] [ROOT]\n")
+	fmt.Fprintf(w, "  sympath ui\n")
 	fmt.Fprintf(w, "  sympath [--verbose] [ROOT]\n\n")
 	fmt.Fprintf(w, "Scans ROOT into the consolidated SQLite inventory database in ~/.sympath.\n")
 	fmt.Fprintf(w, "If ROOT is omitted, the current directory is scanned.\n")
 	fmt.Fprintf(w, "Use --verbose to print database resolution and consolidation details.\n")
-	fmt.Fprintf(w, "On startup, ~/.sympath/remotes is seeded if missing, remotes may be fetched, and ~/.sympath/*.sympath files are consolidated into one file.\n")
+	fmt.Fprintf(w, "On startup, ~/.sympath/remotes is seeded if missing, remotes may be fetched, and ~/.sympath/*.sympath files are consolidated into one file.\n\n")
+	fmt.Fprintf(w, "The ui command consolidates local databases (skipping remote fetch), then\n")
+	fmt.Fprintf(w, "launches a web interface for comparing inventoried directory trees.\n")
 }
 
 type scanSummary struct {
