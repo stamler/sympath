@@ -124,11 +124,10 @@ type fetchedRemote struct {
 }
 
 func resolveRunDBPath(ctx context.Context, transport remoteTransport, logger verboseLogger) (startupState, error) {
-	home, err := os.UserHomeDir()
+	dir, err := sympathStateDir()
 	if err != nil {
-		return startupState{}, fmt.Errorf("resolve home directory for database path: %w", err)
+		return startupState{}, fmt.Errorf("resolve sympath state directory: %w", err)
 	}
-	dir := filepath.Join(home, ".sympath")
 
 	if err := ensureSympathDir(dir, logger); err != nil {
 		return startupState{}, err

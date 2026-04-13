@@ -10,11 +10,9 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"syscall"
 
@@ -42,11 +40,10 @@ func runUIWithIO(args []string, stdout, stderr io.Writer) error {
 		return errors.New("ui accepts no arguments")
 	}
 
-	home, err := os.UserHomeDir()
+	dir, err := sympathStateDir()
 	if err != nil {
-		return fmt.Errorf("resolve home directory: %w", err)
+		return fmt.Errorf("resolve sympath state directory: %w", err)
 	}
-	dir := filepath.Join(home, ".sympath")
 
 	// Suppress warnings from the local-only transport so remote
 	// "skipped" messages don't clutter the UI startup output.
@@ -129,13 +126,7 @@ func requireExistingUIDatabase(dbPath string) error {
 }
 
 func openUIReadOnlyDB(ctx context.Context, dbPath string) (*sql.DB, error) {
-	dsn := (&url.URL{
-		Scheme:   "file",
-		Path:     dbPath,
-		RawQuery: "mode=ro",
-	}).String()
-
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", readOnlySQLiteDSN(dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
