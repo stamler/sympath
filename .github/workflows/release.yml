@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  verify-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Run Linux installer and packaging smoke tests
+        env:
+          RUN_INSTALLER_SMOKE_TESTS: "1"
+        run: go test ./... -run 'TestInstallScript|TestPackageReleaseScript'
+
+  verify-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Run macOS installer smoke tests
+        env:
+          RUN_INSTALLER_SMOKE_TESTS: "1"
+        run: go test ./... -run TestInstallScript
+
+  verify-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run Go tests
+        shell: pwsh
+        run: go test ./...
+
+      - name: Run Windows installer smoke tests
+        shell: pwsh
+        env:
+          RUN_INSTALLER_SMOKE_TESTS: "1"
+        run: go test ./... -run TestInstallPowerShell
+
+  release:
+    needs:
+      - verify-linux
+      - verify-macos
+      - verify-windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Package release artifacts
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: scripts/package-release.sh
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/sympath-darwin-arm64.tar.gz
+            dist/sympath-linux-amd64.tar.gz
+            dist/sympath-windows-amd64.zip
+            dist/checksums.txt

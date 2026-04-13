@@ -33,6 +33,9 @@ func TestPrintUsage_DoesNotMentionDBFlag(t *testing.T) {
 	if !strings.Contains(out, "--verbose") {
 		t.Fatalf("expected usage to mention --verbose, got:\n%s", out)
 	}
+	if !strings.Contains(out, "sympath version") {
+		t.Fatalf("expected usage to mention version command, got:\n%s", out)
+	}
 }
 
 func TestRunScan_VerboseReportsDatabaseSetup(t *testing.T) {
@@ -65,5 +68,35 @@ func TestRunScan_VerboseReportsDatabaseSetup(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "Scan complete") {
 		t.Fatalf("expected scan summary on stdout, got:\n%s", stdout.String())
+	}
+}
+
+func TestRunWithIO_VersionCommandPrintsBuildVersion(t *testing.T) {
+	prev := version
+	version = "v1.2.3"
+	t.Cleanup(func() { version = prev })
+
+	var stdout bytes.Buffer
+	if err := runWithIO([]string{"version"}, &stdout, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := stdout.String(); got != "v1.2.3\n" {
+		t.Fatalf("expected version output, got %q", got)
+	}
+}
+
+func TestRunWithIO_VersionFlagPrintsBuildVersion(t *testing.T) {
+	prev := version
+	version = "v9.9.9"
+	t.Cleanup(func() { version = prev })
+
+	var stdout bytes.Buffer
+	if err := runWithIO([]string{"--version"}, &stdout, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := stdout.String(); got != "v9.9.9\n" {
+		t.Fatalf("expected version output, got %q", got)
 	}
 }

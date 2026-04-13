@@ -1,5 +1,6 @@
 cmd/sympath/sympath
 /sympath
+/sympath.exe
 file_times.chatlog
 .claude/settings.local.json
 .gocache/

@@ -73,6 +73,7 @@ const remotesFileTemplate = `# sympath remotes configuration
 # - An SSH config alias from ~/.ssh/config.
 # - A plain host name.
 # - A user@host target.
+# - A root@host target, if that remote allows root SSH login.
 #
 # WHAT YOU MAY NOT INCLUDE
 # - Multiple targets on one line.
@@ -85,6 +86,11 @@ const remotesFileTemplate = `# sympath remotes configuration
 # Put those details in ~/.ssh/config. This file intentionally stays
 # simple so the parser is predictable and the meaning of each line is
 # unambiguous.
+#
+# REMOTE ACCOUNT BEHAVIOR
+# - Each remote is fetched as the SSH login account in this file.
+# - root@host reads /root/.sympath/*.sympath on that machine.
+# - user@host reads that user's ~/.sympath/*.sympath instead.
 #
 # IMPORTANT OPERATIONAL NOTES
 # - Only the machine with this file populated should aggregate remotes.

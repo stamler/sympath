@@ -242,11 +242,30 @@ func TestResolveRunDBPath_SeedsRemotesFileWithDocumentation(t *testing.T) {
 	if !strings.Contains(text, "If a remote fetch fails, sympath warns and continues") {
 		t.Fatalf("expected remotes file to document fetch failure behavior, got:\n%s", text)
 	}
+	if !strings.Contains(text, "Each remote is fetched as the SSH login account in this file.") {
+		t.Fatalf("expected remotes file to document remote account behavior, got:\n%s", text)
+	}
 	if _, err := os.Stat(filepath.Join(home, ".sympath", machineIDFileName)); err != nil {
 		t.Fatalf("expected machine-id file to be created, got %v", err)
 	}
 	if filepath.Dir(startup.DBPath) != filepath.Join(home, ".sympath") {
 		t.Fatalf("expected DB path inside ~/.sympath, got %q", startup.DBPath)
+	}
+}
+
+func TestLoadRemoteTargets_AcceptsRootAccountTargets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), remotesFileName)
+	if err := os.WriteFile(path, []byte("root@fileserver\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	remotes, err := loadRemoteTargets(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(remotes) != 1 || remotes[0] != "root@fileserver" {
+		t.Fatalf("expected root account target to parse, got %#v", remotes)
 	}
 }
 

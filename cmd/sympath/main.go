@@ -17,6 +17,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+var version = "dev"
+
 type verboseLogger struct {
 	w       io.Writer
 	enabled bool
@@ -59,6 +61,9 @@ func runWithIO(args []string, stdout, stderr io.Writer) error {
 	switch args[0] {
 	case "-h", "--help", "help":
 		printUsage(stdout)
+		return nil
+	case "-version", "--version", "version":
+		fmt.Fprintln(stdout, version)
 		return nil
 	case "scan":
 		return runScanWithIO(args[1:], stdout, stderr)
@@ -138,6 +143,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "Usage:\n")
 	fmt.Fprintf(w, "  sympath scan [--verbose] [ROOT]\n")
 	fmt.Fprintf(w, "  sympath ui\n")
+	fmt.Fprintf(w, "  sympath version\n")
 	fmt.Fprintf(w, "  sympath [--verbose] [ROOT]\n\n")
 	fmt.Fprintf(w, "Scans ROOT into the consolidated SQLite inventory database in ~/.sympath.\n")
 	fmt.Fprintf(w, "If ROOT is omitted, the current directory is scanned.\n")
@@ -145,6 +151,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "On startup, ~/.sympath/remotes is seeded if missing, remotes may be fetched, and ~/.sympath/*.sympath files are consolidated into one file.\n\n")
 	fmt.Fprintf(w, "The ui command consolidates local databases (skipping remote fetch), then\n")
 	fmt.Fprintf(w, "launches a web interface for comparing inventoried directory trees.\n")
+	fmt.Fprintf(w, "Use sympath version or sympath --version to print the build version.\n")
 }
 
 type scanSummary struct {
