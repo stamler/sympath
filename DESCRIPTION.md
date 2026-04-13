@@ -25,12 +25,16 @@ or, equivalently:
 go run ./cmd/sympath /path/to/root
 ```
 
-On each run, the CLI consolidates all `~/.sympath/*.sympath` files into
-one surviving database file and then scans into that file. If the
-directory is empty, it creates a new random 10-character alphanumeric
-`.sympath` filename with `NewRandomSympathFilename()`. Pass `--verbose`
-to print startup messages about directory creation, consolidation, and
-the final database path in use.
+On each run, the CLI ensures `~/.sympath` exists, seeds a documented
+blank `~/.sympath/remotes` file if one is missing, ensures a stable
+`~/.sympath/machine-id` file exists, optionally fetches remote
+`~/.sympath/*.sympath` databases listed in `remotes`, consolidates the
+local and fetched databases into one surviving local database file, and
+then scans into that file. If no database exists yet, it creates a new
+random 10-character alphanumeric `.sympath` filename with
+`NewRandomSympathFilename()`. Pass `--verbose` to print startup messages
+about directory creation, remote fetching, consolidation, and the final
+database path in use.
 
 Each call produces a complete snapshot of every regular file under `root`.
 Subsequent calls reuse hashes from the previous snapshot when a file's size
@@ -99,14 +103,21 @@ of files are unchanged, this skips 90% of disk I/O.
 
 ## Database Schema
 
-Three tables, one index each:
+Four tables are used:
+
+### `metadata`
+
+Small key/value storage used for the local machine identity assigned to
+the database currently being scanned into.
 
 ### `roots`
 
-One row per monitored root directory. Points at the current authoritative scan.
+One row per monitored root directory per machine. Points at the current
+authoritative scan for that machine/path pair.
 
 | Column            | Type    | Notes               |
 |-------------------|---------|----------------------|
+| machine_id        | TEXT PK | Stable machine identifier |
 | root              | TEXT PK | Absolute path        |
 | current_scan_id   | INTEGER | FK to scans.scan_id  |
 
@@ -117,6 +128,8 @@ One row per scan attempt.
 | Column          | Type    | Notes                                  |
 |-----------------|---------|----------------------------------------|
 | scan_id         | INTEGER PK | Auto-increment (SQLite rowid alias) |
+| machine_id      | TEXT    | Stable machine identifier              |
+| hostname        | TEXT    | Human-readable machine hostname        |
 | root            | TEXT    | Absolute path of the scanned directory |
 | started_at      | INTEGER | Unix nanoseconds                       |
 | finished_at     | INTEGER | Unix nanoseconds (NULL while running)  |
@@ -147,7 +160,7 @@ Primary key: `(scan_id, rel_path)`.
 
 ### Indexes
 
-- `idx_scans_root_status` on `scans(root, status)`
+- `idx_scans_machine_root_status` on `scans(machine_id, root, status)`
 - `idx_entries_scan` on `entries(scan_id)`
 
 ### Pragmas

@@ -424,15 +424,12 @@ func TestInventoryTree_OrphanedScanCleanup(t *testing.T) {
 	absRoot, _ := resolveAbsPath(scanDir)
 
 	// Manually create an orphaned "running" scan
-	if err := ConfigureConnection(ctx, db); err != nil {
-		t.Fatal(err)
-	}
-	if err := EnsureSchema(ctx, db); err != nil {
+	if err := PrepareLocalMachineDB(ctx, db, MachineIdentity{MachineID: "test-machine", Hostname: "test-host"}); err != nil {
 		t.Fatal(err)
 	}
 	_, err := db.ExecContext(ctx,
-		"INSERT INTO scans (root, started_at, status) VALUES (?, ?, 'running')",
-		absRoot, time.Now().UnixNano(),
+		"INSERT INTO scans (machine_id, hostname, root, started_at, status) VALUES (?, ?, ?, ?, 'running')",
+		"test-machine", "test-host", absRoot, time.Now().UnixNano(),
 	)
 	if err != nil {
 		t.Fatal(err)

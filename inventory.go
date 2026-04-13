@@ -57,7 +57,8 @@ func InventoryTree(ctx context.Context, db *sql.DB, root string) error {
 	if err := ConfigureConnection(ctx, db); err != nil {
 		return err
 	}
-	if err := EnsureSchema(ctx, db); err != nil {
+	identity, err := GetLocalMachineIdentity(ctx, db)
+	if err != nil {
 		return err
 	}
 
@@ -69,7 +70,7 @@ func InventoryTree(ctx context.Context, db *sql.DB, root string) error {
 	excludeSet := makeExcludeSet(dbPath)
 
 	// Load previous scan entries for reuse
-	prevScanID, err := getCurrentScanID(ctx, db, absRoot)
+	prevScanID, err := getCurrentScanID(ctx, db, identity.MachineID, absRoot)
 	if err != nil {
 		return err
 	}
@@ -82,7 +83,7 @@ func InventoryTree(ctx context.Context, db *sql.DB, root string) error {
 	volInfo := DetectVolumeInfo(absRoot)
 
 	// Create new scan
-	scanID, err := createScan(ctx, db, absRoot, volInfo)
+	scanID, err := createScan(ctx, db, identity, absRoot, volInfo)
 	if err != nil {
 		return err
 	}
@@ -141,16 +142,16 @@ func InventoryTree(ctx context.Context, db *sql.DB, root string) error {
 	}
 
 	// Publish the scan
-	return publishScan(ctx, db, scanID, absRoot)
+	return publishScan(ctx, db, scanID, identity.MachineID, absRoot)
 }
 
 // getCurrentScanID returns the current_scan_id for a root from the roots
 // table, or 0 if no previous scan exists. A zero return value signals to
 // the caller that no previous entries are available for reuse.
-func getCurrentScanID(ctx context.Context, db *sql.DB, root string) (int64, error) {
+func getCurrentScanID(ctx context.Context, db *sql.DB, machineID, root string) (int64, error) {
 	var scanID sql.NullInt64
 	err := db.QueryRowContext(ctx,
-		"SELECT current_scan_id FROM roots WHERE root = ?", root,
+		"SELECT current_scan_id FROM roots WHERE machine_id = ? AND root = ?", machineID, root,
 	).Scan(&scanID)
 	if err == sql.ErrNoRows {
 		return 0, nil
@@ -204,15 +205,15 @@ func loadPreviousEntries(ctx context.Context, db *sql.DB, scanID int64) (map[str
 // its auto-generated scan_id. The row records the root path, start
 // timestamp, runtime platform (GOOS, GOARCH), filesystem type, and
 // case sensitivity flag from the detected VolumeInfo.
-func createScan(ctx context.Context, db *sql.DB, root string, vol VolumeInfo) (int64, error) {
+func createScan(ctx context.Context, db *sql.DB, identity MachineIdentity, root string, vol VolumeInfo) (int64, error) {
 	caseSensitive := 0
 	if vol.CaseSensitive {
 		caseSensitive = 1
 	}
 	result, err := db.ExecContext(ctx,
-		`INSERT INTO scans (root, started_at, status, goos, goarch, fs_type, case_sensitive)
-		 VALUES (?, ?, 'running', ?, ?, ?, ?)`,
-		root, time.Now().UnixNano(),
+		`INSERT INTO scans (machine_id, hostname, root, started_at, status, goos, goarch, fs_type, case_sensitive)
+		 VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)`,
+		identity.MachineID, identity.Hostname, root, time.Now().UnixNano(),
 		runtime.GOOS, runtime.GOARCH, vol.FSType, caseSensitive,
 	)
 	if err != nil {
@@ -227,7 +228,7 @@ func createScan(ctx context.Context, db *sql.DB, root string, vol VolumeInfo) (i
 // roots table to point current_scan_id at this scan, and (3) deletes
 // all other scans for the same root (CASCADE deletes their entries).
 // This is the commit point — if it succeeds, the new scan is live.
-func publishScan(ctx context.Context, db *sql.DB, scanID int64, root string) error {
+func publishScan(ctx context.Context, db *sql.DB, scanID int64, machineID, root string) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -242,9 +243,9 @@ func publishScan(ctx context.Context, db *sql.DB, scanID int64, root string) err
 	}
 
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO roots (root, current_scan_id) VALUES (?, ?)
-		 ON CONFLICT(root) DO UPDATE SET current_scan_id=excluded.current_scan_id`,
-		root, scanID,
+		`INSERT INTO roots (machine_id, root, current_scan_id) VALUES (?, ?, ?)
+		 ON CONFLICT(machine_id, root) DO UPDATE SET current_scan_id=excluded.current_scan_id`,
+		machineID, root, scanID,
 	); err != nil {
 		tx.Rollback()
 		return err
@@ -252,8 +253,8 @@ func publishScan(ctx context.Context, db *sql.DB, scanID int64, root string) err
 
 	// Delete all other scans for this root (CASCADE deletes their entries)
 	if _, err := tx.ExecContext(ctx,
-		"DELETE FROM scans WHERE root=? AND scan_id <> ?",
-		root, scanID,
+		"DELETE FROM scans WHERE machine_id = ? AND root=? AND scan_id <> ?",
+		machineID, root, scanID,
 	); err != nil {
 		tx.Rollback()
 		return err

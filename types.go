@@ -6,6 +6,17 @@
 // The primary entry point is [InventoryTree].
 package inventory
 
+// MachineIdentity identifies the machine producing local scan rows.
+//
+// MachineID is the stable, persistent identifier used for database keys
+// and cross-machine consolidation. Hostname is display metadata that
+// helps operators understand which machine produced a scan, but it is
+// not used as the authoritative identity because hostnames can change.
+type MachineIdentity struct {
+	MachineID string
+	Hostname  string
+}
+
 // PrevEntry holds the subset of a previous scan's entry needed for reuse
 // decisions during the walk phase. If a file's Size and MtimeNS match
 // the previous scan, its Fingerprint and SHA256 are copied forward
