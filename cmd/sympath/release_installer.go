@@ -322,7 +322,7 @@ func executableNameForGOOS(goos string) string {
 
 func managedInstallTargetForGOOS(goos, home, localAppData, installDirOverride string) (string, error) {
 	if installDirOverride != "" {
-		return filepath.Join(installDirOverride, executableNameForGOOS(goos)), nil
+		return joinPathForGOOS(goos, installDirOverride, executableNameForGOOS(goos)), nil
 	}
 
 	switch goos {
@@ -335,8 +335,20 @@ func managedInstallTargetForGOOS(goos, home, localAppData, installDirOverride st
 		}
 		return filepath.Join(localAppData, "Programs", "sympath", "bin", executableNameForGOOS(goos)), nil
 	default:
-		return filepath.Join(home, ".local", "bin", executableNameForGOOS(goos)), nil
+		return joinPathForGOOS(goos, home, ".local", "bin", executableNameForGOOS(goos)), nil
 	}
+}
+
+func joinPathForGOOS(goos string, elems ...string) string {
+	if goos == "windows" {
+		return filepath.Join(elems...)
+	}
+
+	slashed := make([]string, 0, len(elems))
+	for _, elem := range elems {
+		slashed = append(slashed, filepath.ToSlash(elem))
+	}
+	return path.Join(slashed...)
 }
 
 func sameExecutablePath(left, right, goos string) bool {
