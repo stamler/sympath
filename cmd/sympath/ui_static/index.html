@@ -8,8 +8,19 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f5f5f5; color: #222; }
 
-header { background: #1a1a2e; color: #eee; padding: 12px 24px; display: flex; align-items: center; gap: 16px; }
+header { background: #1a1a2e; color: #eee; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+header .brand { display: flex; align-items: center; gap: 16px; }
 header h1 { font-size: 18px; font-weight: 600; }
+.app-status { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; font-size: 12px; }
+.version-pill, .status-pill {
+  display: inline-flex; align-items: center; border-radius: 999px; padding: 5px 10px;
+  background: rgba(255,255,255,0.08); color: #f3f3f3; border: 1px solid rgba(255,255,255,0.12);
+}
+.status-pill.ok { background: rgba(76, 175, 80, 0.14); color: #d9f5de; border-color: rgba(76, 175, 80, 0.3); }
+.status-pill.update { background: rgba(255, 193, 7, 0.14); color: #ffefb3; border-color: rgba(255, 193, 7, 0.32); }
+.status-pill.muted { color: #d0d0d0; }
+.status-pill a { color: inherit; text-decoration: none; }
+.status-pill a:hover { text-decoration: underline; }
 
 .selectors { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px 24px; background: #fff; border-bottom: 1px solid #ddd; }
 .selector-col label { display: block; font-size: 12px; font-weight: 600; text-transform: uppercase; color: #666; margin-bottom: 4px; }
@@ -75,7 +86,10 @@ td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; font-
 <body>
 
 <header>
-  <h1>sympath</h1>
+  <div class="brand">
+    <h1>sympath</h1>
+  </div>
+  <div class="app-status" id="app-status">Version loading...</div>
 </header>
 
 <div class="selectors">
@@ -115,11 +129,13 @@ const rightRootSel = document.getElementById('right-root');
 const byContentBox = document.getElementById('by-content');
 const summaryEl = document.getElementById('summary');
 const resultsEl = document.getElementById('results');
+const statusEl = document.getElementById('app-status');
 
 let roots = [];
 const dirsCache = {};
 
 async function init() {
+  initStatus();
   try {
     const resp = await fetch('/api/roots');
     roots = await resp.json();
@@ -133,6 +149,35 @@ async function init() {
   ).join('');
   leftRootSel.innerHTML = placeholder + opts;
   rightRootSel.innerHTML = placeholder + opts;
+}
+
+async function initStatus() {
+  try {
+    const resp = await fetch('/api/status');
+    if (!resp.ok) throw new Error(await resp.text());
+    renderStatus(await resp.json());
+  } catch (e) {
+    statusEl.textContent = 'Update status unavailable';
+  }
+}
+
+function renderStatus(status) {
+  const parts = [];
+  parts.push(`<span class="version-pill">Version ${esc(status.current_version || 'unknown')}</span>`);
+
+  if (!status.supported) {
+    parts.push('<span class="status-pill muted">Update checks unavailable for this build</span>');
+  } else if (status.update_available) {
+    const href = escAttr(status.release_url || '#');
+    const latest = esc(status.latest_version || 'unknown');
+    parts.push(`<span class="status-pill update"><a href="${href}" target="_blank" rel="noreferrer">Update available: ${latest}</a></span>`);
+  } else if (status.unavailable) {
+    parts.push('<span class="status-pill muted">Update status unavailable</span>');
+  } else {
+    parts.push('<span class="status-pill ok">Up to date</span>');
+  }
+
+  statusEl.innerHTML = parts.join('');
 }
 
 async function fetchDirs(rootIdx) {
@@ -485,6 +530,15 @@ function esc(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+function escAttr(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/'/g, '&#39;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 function fmtSize(bytes) {

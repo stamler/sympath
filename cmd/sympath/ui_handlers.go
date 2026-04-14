@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
@@ -9,13 +10,30 @@ import (
 )
 
 type uiServer struct {
-	db *sql.DB
+	db      *sql.DB
+	updates updateChecker
 }
 
 type rootEntry struct {
 	MachineID string `json:"machine_id"`
 	Hostname  string `json:"hostname"`
 	Root      string `json:"root"`
+}
+
+func (s *uiServer) handleStatus(w http.ResponseWriter, r *http.Request) {
+	checker := s.updates.withDefaults()
+
+	ctx, cancel := context.WithTimeout(r.Context(), updateCheckTimeout)
+	defer cancel()
+
+	status, err := checker.resolveStatus(ctx, version, false)
+	if err != nil {
+		// The UI still renders current version details even when the
+		// live refresh is unavailable, so surface the status payload.
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
 }
 
 func (s *uiServer) handleRoots(w http.ResponseWriter, r *http.Request) {

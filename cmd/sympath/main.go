@@ -54,24 +54,39 @@ func run(args []string) error {
 }
 
 func runWithIO(args []string, stdout, stderr io.Writer) error {
-	if len(args) == 0 {
-		return runScanWithIO(nil, stdout, stderr)
+	var updates *autoUpdateCheck
+	if shouldAutoCheck(args) {
+		updates = newUpdateChecker().startAutoCheck(version)
 	}
 
+	if len(args) == 0 {
+		if err := runScanWithIO(nil, stdout, stderr); err != nil {
+			return err
+		}
+		return emitAutoUpdateNotice(stderr, updates)
+	}
+
+	var err error
 	switch args[0] {
 	case "-h", "--help", "help":
 		printUsage(stdout)
 		return nil
 	case "-version", "--version", "version":
 		fmt.Fprintln(stdout, version)
-		return nil
+	case "update-check":
+		err = runUpdateCheckWithIO(args[1:], stdout, stderr)
 	case "scan":
-		return runScanWithIO(args[1:], stdout, stderr)
+		err = runScanWithIO(args[1:], stdout, stderr)
 	case "ui":
-		return runUIWithIO(args[1:], stdout, stderr)
+		err = runUIWithIO(args[1:], stdout, stderr)
 	default:
-		return runScanWithIO(args, stdout, stderr)
+		err = runScanWithIO(args, stdout, stderr)
 	}
+
+	if err != nil {
+		return err
+	}
+	return emitAutoUpdateNotice(stderr, updates)
 }
 
 func runScanWithIO(args []string, stdout, stderr io.Writer) error {
@@ -156,6 +171,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "  sympath scan [--verbose] [ROOT]\n")
 	fmt.Fprintf(w, "  sympath ui\n")
 	fmt.Fprintf(w, "  sympath version\n")
+	fmt.Fprintf(w, "  sympath update-check\n")
 	fmt.Fprintf(w, "  sympath [--verbose] [ROOT]\n\n")
 	fmt.Fprintf(w, "Scans ROOT into the consolidated SQLite inventory database in ~/.sympath.\n")
 	fmt.Fprintf(w, "If ROOT is omitted, the current directory is scanned.\n")
@@ -164,6 +180,48 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "The ui command consolidates local databases (skipping remote fetch), then\n")
 	fmt.Fprintf(w, "launches a web interface for comparing inventoried directory trees.\n")
 	fmt.Fprintf(w, "Use sympath version or sympath --version to print the build version.\n")
+	fmt.Fprintf(w, "Use sympath update-check to force a live release check.\n")
+	fmt.Fprintf(w, "Successful scan, ui, and version commands may print a brief stderr-only update notice.\n")
+}
+
+func shouldAutoCheck(args []string) bool {
+	if len(args) == 0 {
+		return true
+	}
+
+	switch args[0] {
+	case "-h", "--help", "help", "update-check":
+		return false
+	default:
+		return true
+	}
+}
+
+func emitAutoUpdateNotice(stderr io.Writer, updates *autoUpdateCheck) error {
+	if updates == nil {
+		return nil
+	}
+	if notice := updates.notice(); notice != "" {
+		fmt.Fprintln(stderr, notice)
+	}
+	return nil
+}
+
+func runUpdateCheckWithIO(args []string, stdout, stderr io.Writer) error {
+	if len(args) > 0 {
+		return errors.New("update-check accepts no arguments")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), updateCheckTimeout)
+	defer cancel()
+
+	status, err := newUpdateChecker().resolveStatus(ctx, version, true)
+	if err != nil {
+		return fmt.Errorf("live check failed: %w", err)
+	}
+
+	fmt.Fprintln(stdout, formatUpdateCheckMessage(status))
+	return nil
 }
 
 type scanSummary struct {

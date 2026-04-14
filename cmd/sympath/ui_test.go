@@ -5,12 +5,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"path"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	inventory "sympath"
 
@@ -191,6 +193,159 @@ func TestRunUIWithIONoInventoryDB(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "run `sympath scan [ROOT]` first") {
 		t.Fatalf("expected friendly scan-first error, got %v", err)
+	}
+}
+
+func TestHandleStatusUpdateAvailable(t *testing.T) {
+	prev := version
+	version = "v1.2.3"
+	t.Cleanup(func() { version = prev })
+
+	srv := &uiServer{
+		updates: updateChecker{
+			stateDir: func() (string, error) { return t.TempDir(), nil },
+			now:      time.Now,
+			fetchLatest: func(context.Context) (latestRelease, error) {
+				return latestRelease{
+					Version: "v1.2.4",
+					URL:     "https://example.com/releases/v1.2.4",
+				}, nil
+			},
+		},
+	}
+
+	req := httptest.NewRequest("GET", "/api/status", nil)
+	rec := httptest.NewRecorder()
+	srv.handleStatus(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var status updateStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if !status.Supported || !status.UpdateAvailable || status.LatestVersion != "v1.2.4" {
+		t.Fatalf("expected update-available status, got %+v", status)
+	}
+}
+
+func TestHandleStatusUpToDate(t *testing.T) {
+	prev := version
+	version = "v1.2.3"
+	t.Cleanup(func() { version = prev })
+
+	srv := &uiServer{
+		updates: updateChecker{
+			stateDir: func() (string, error) { return t.TempDir(), nil },
+			now:      time.Now,
+			fetchLatest: func(context.Context) (latestRelease, error) {
+				return latestRelease{
+					Version: "v1.2.3",
+					URL:     "https://example.com/releases/v1.2.3",
+				}, nil
+			},
+		},
+	}
+
+	req := httptest.NewRequest("GET", "/api/status", nil)
+	rec := httptest.NewRecorder()
+	srv.handleStatus(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var status updateStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if !status.Supported || status.UpdateAvailable || status.Unavailable {
+		t.Fatalf("expected up-to-date status, got %+v", status)
+	}
+}
+
+func TestHandleStatusUnsupportedBuild(t *testing.T) {
+	prev := version
+	version = "dev"
+	t.Cleanup(func() { version = prev })
+
+	srv := &uiServer{
+		updates: updateChecker{
+			stateDir: func() (string, error) { return t.TempDir(), nil },
+			now:      time.Now,
+			fetchLatest: func(context.Context) (latestRelease, error) {
+				t.Fatal("expected unsupported build to skip live fetch")
+				return latestRelease{}, nil
+			},
+		},
+	}
+
+	req := httptest.NewRequest("GET", "/api/status", nil)
+	rec := httptest.NewRecorder()
+	srv.handleStatus(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var status updateStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.Supported || status.UpdateAvailable || status.Unavailable {
+		t.Fatalf("expected unsupported-build status, got %+v", status)
+	}
+}
+
+func TestHandleStatusUnavailable(t *testing.T) {
+	prev := version
+	version = "v1.2.3"
+	t.Cleanup(func() { version = prev })
+
+	srv := &uiServer{
+		updates: updateChecker{
+			stateDir: func() (string, error) { return t.TempDir(), nil },
+			now:      time.Now,
+			fetchLatest: func(context.Context) (latestRelease, error) {
+				return latestRelease{}, context.DeadlineExceeded
+			},
+		},
+	}
+
+	req := httptest.NewRequest("GET", "/api/status", nil)
+	rec := httptest.NewRecorder()
+	srv.handleStatus(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var status updateStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if !status.Supported || !status.Unavailable {
+		t.Fatalf("expected unavailable status, got %+v", status)
+	}
+}
+
+func TestEmbeddedUIIncludesStatusMountAndFetchPath(t *testing.T) {
+	content, err := fs.ReadFile(uiStaticFS, "ui_static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	html := string(content)
+	if !strings.Contains(html, "id=\"app-status\"") {
+		t.Fatalf("expected status mount in embedded UI, got:\n%s", html)
+	}
+	if !strings.Contains(html, "fetch('/api/status')") {
+		t.Fatalf("expected status fetch path in embedded UI, got:\n%s", html)
+	}
+	if !strings.Contains(html, ".replace(/'/g, '&#39;')") {
+		t.Fatalf("expected single-quote escaping in attribute helper, got:\n%s", html)
 	}
 }
 

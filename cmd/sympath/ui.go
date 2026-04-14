@@ -70,8 +70,9 @@ func runUIWithIO(args []string, stdout, stderr io.Writer) error {
 	}
 	defer db.Close()
 
-	srv := &uiServer{db: db}
+	srv := &uiServer{db: db, updates: newUpdateChecker()}
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/status", srv.handleStatus)
 	mux.HandleFunc("/api/roots", srv.handleRoots)
 	mux.HandleFunc("/api/dirs", srv.handleDirs)
 	mux.HandleFunc("/api/compare", srv.handleCompare)
