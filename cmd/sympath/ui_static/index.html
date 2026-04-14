@@ -126,6 +126,7 @@ td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; font-
 
 <div class="options">
   <label><input type="checkbox" id="by-content"> Match by content (ignore path)</label>
+  <label><input type="checkbox" id="ignore-common-os" checked> Ignore common OS metadata files</label>
   <div class="compare-controls">
     <span class="compare-status" id="compare-status">Select a root on each side to compare.</span>
     <button type="button" class="compare-button" id="compare-button" disabled>Compare</button>
@@ -142,6 +143,7 @@ td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; font-
 const leftRootSel = document.getElementById('left-root');
 const rightRootSel = document.getElementById('right-root');
 const byContentBox = document.getElementById('by-content');
+const ignoreCommonOSBox = document.getElementById('ignore-common-os');
 const compareButton = document.getElementById('compare-button');
 const compareStatusEl = document.getElementById('compare-status');
 const summaryEl = document.getElementById('summary');
@@ -225,6 +227,7 @@ function getCompareParams() {
   if (lp) params.set('left_prefix', lp);
   if (rp) params.set('right_prefix', rp);
   if (byContentBox.checked) params.set('by_content', '1');
+  if (ignoreCommonOSBox.checked) params.set('ignore_common_os', '1');
   return params;
 }
 
@@ -516,6 +519,7 @@ const leftAc = createAutocomplete(leftRootSel, 'left-dir', 'left-ghost', 'left-l
 const rightAc = createAutocomplete(rightRootSel, 'right-dir', 'right-ghost', 'right-list');
 
 byContentBox.addEventListener('change', markCompareDirty);
+ignoreCommonOSBox.addEventListener('change', markCompareDirty);
 compareButton.addEventListener('click', compare);
 
 // --- Compare logic ---

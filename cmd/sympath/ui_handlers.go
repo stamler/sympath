@@ -135,13 +135,14 @@ func (s *uiServer) handleCompare(w http.ResponseWriter, r *http.Request) {
 	leftPrefix := q.Get("left_prefix")
 	rightPrefix := q.Get("right_prefix")
 	byContent := q.Get("by_content") == "1"
+	ignoreCommonOS := q.Get("ignore_common_os") == "1"
 
 	if leftMachine == "" || leftRoot == "" || rightMachine == "" || rightRoot == "" {
 		http.Error(w, "left_machine, left_root, right_machine, and right_root are required", http.StatusBadRequest)
 		return
 	}
 
-	result, err := compareRoots(r.Context(), s.db, leftMachine, leftRoot, rightMachine, rightRoot, leftPrefix, rightPrefix, byContent)
+	result, err := compareRoots(r.Context(), s.db, leftMachine, leftRoot, rightMachine, rightRoot, leftPrefix, rightPrefix, byContent, ignoreCommonOS)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

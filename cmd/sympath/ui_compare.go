@@ -8,6 +8,14 @@ import (
 	"unicode/utf8"
 )
 
+var ignoredCommonOSBasenames = []string{
+	".ds_store",
+	"thumbs.db",
+	"ehthumbs.db",
+	"desktop.ini",
+	".directory",
+}
+
 type compareResult struct {
 	IdenticalCount int            `json:"identical_count"`
 	LeftOnly       []fileEntry    `json:"left_only"`
@@ -55,28 +63,46 @@ func normalizePrefix(p string) string {
 	return p + "/"
 }
 
+func ignoredCommonOSClause(ignoreCommonOS bool) (string, []any) {
+	if !ignoreCommonOS {
+		return "", nil
+	}
+
+	args := make([]any, 0, len(ignoredCommonOSBasenames))
+	placeholders := make([]string, 0, len(ignoredCommonOSBasenames))
+	for _, name := range ignoredCommonOSBasenames {
+		placeholders = append(placeholders, "?")
+		args = append(args, name)
+	}
+
+	return fmt.Sprintf(" AND LOWER(name) NOT IN (%s)", strings.Join(placeholders, ", ")), args
+}
+
 // entryCTEs returns the WITH clause and args that produce left_entries
 // and right_entries filtered by prefix.
-func entryCTEs(leftScan, rightScan int64, leftPrefix, rightPrefix string) (string, []any) {
+func entryCTEs(leftScan, rightScan int64, leftPrefix, rightPrefix string, ignoreCommonOS bool) (string, []any) {
 	lp := normalizePrefix(leftPrefix)
 	rp := normalizePrefix(rightPrefix)
 	joinOnRawPath := lp != "" && lp == rp
 
-	leftCTE, leftArgs := filteredEntriesCTE("left_entries", leftScan, lp, joinOnRawPath)
-	rightCTE, rightArgs := filteredEntriesCTE("right_entries", rightScan, rp, joinOnRawPath)
+	leftCTE, leftArgs := filteredEntriesCTE("left_entries", leftScan, lp, joinOnRawPath, ignoreCommonOS)
+	rightCTE, rightArgs := filteredEntriesCTE("right_entries", rightScan, rp, joinOnRawPath, ignoreCommonOS)
 
 	return fmt.Sprintf(`
 		WITH %s,
 		%s`, leftCTE, rightCTE), append(leftArgs, rightArgs...)
 }
 
-func filteredEntriesCTE(name string, scanID int64, prefix string, joinOnRawPath bool) (string, []any) {
+func filteredEntriesCTE(name string, scanID int64, prefix string, joinOnRawPath, ignoreCommonOS bool) (string, []any) {
+	ignoreClause, ignoreArgs := ignoredCommonOSClause(ignoreCommonOS)
+
 	if prefix == "" {
 		return fmt.Sprintf(`%s AS (
 			SELECT rel_path AS join_path, rel_path, size, sha256
 			FROM entries
 			WHERE scan_id = ?
-		)`, name), []any{scanID}
+			%s
+		)`, name, ignoreClause), append([]any{scanID}, ignoreArgs...)
 	}
 
 	// SQLite SUBSTR counts characters, not bytes, so this offset must
@@ -95,7 +121,8 @@ func filteredEntriesCTE(name string, scanID int64, prefix string, joinOnRawPath 
 			WHERE scan_id = ?
 			  AND rel_path >= ?
 			  AND rel_path < ? || x'FF'
-		)`, name), []any{start, scanID, prefix, prefix}
+			  %s
+		)`, name, ignoreClause), append([]any{start, scanID, prefix, prefix}, ignoreArgs...)
 	}
 
 	return fmt.Sprintf(`%s AS (
@@ -107,10 +134,11 @@ func filteredEntriesCTE(name string, scanID int64, prefix string, joinOnRawPath 
 		WHERE scan_id = ?
 		  AND rel_path >= ?
 		  AND rel_path < ? || x'FF'
-	)`, name), []any{start, start, scanID, prefix, prefix}
+		  %s
+	)`, name, ignoreClause), append([]any{start, start, scanID, prefix, prefix}, ignoreArgs...)
 }
 
-func compareRoots(ctx context.Context, db *sql.DB, leftMachine, leftRoot, rightMachine, rightRoot, leftPrefix, rightPrefix string, byContent bool) (compareResult, error) {
+func compareRoots(ctx context.Context, db *sql.DB, leftMachine, leftRoot, rightMachine, rightRoot, leftPrefix, rightPrefix string, byContent, ignoreCommonOS bool) (compareResult, error) {
 	leftScan, err := resolveScanID(ctx, db, leftMachine, leftRoot)
 	if err != nil {
 		return compareResult{}, fmt.Errorf("resolve left scan: %w", err)
@@ -121,13 +149,13 @@ func compareRoots(ctx context.Context, db *sql.DB, leftMachine, leftRoot, rightM
 	}
 
 	if byContent {
-		return compareByContent(ctx, db, leftScan, rightScan, leftPrefix, rightPrefix)
+		return compareByContent(ctx, db, leftScan, rightScan, leftPrefix, rightPrefix, ignoreCommonOS)
 	}
-	return compareByPath(ctx, db, leftScan, rightScan, leftPrefix, rightPrefix)
+	return compareByPath(ctx, db, leftScan, rightScan, leftPrefix, rightPrefix, ignoreCommonOS)
 }
 
-func compareByPath(ctx context.Context, db *sql.DB, leftScan, rightScan int64, leftPrefix, rightPrefix string) (compareResult, error) {
-	cte, args := entryCTEs(leftScan, rightScan, leftPrefix, rightPrefix)
+func compareByPath(ctx context.Context, db *sql.DB, leftScan, rightScan int64, leftPrefix, rightPrefix string, ignoreCommonOS bool) (compareResult, error) {
+	cte, args := entryCTEs(leftScan, rightScan, leftPrefix, rightPrefix, ignoreCommonOS)
 	identicalPredicate := identicalByPathPredicate("l", "r")
 
 	var result compareResult
@@ -204,8 +232,8 @@ func identicalByPathPredicate(leftAlias, rightAlias string) string {
 // When the same sha256 appears N times on the left and M times on the
 // right, min(N,M) copies are counted as identical and the remaining
 // |N-M| copies appear as left-only or right-only.
-func compareByContent(ctx context.Context, db *sql.DB, leftScan, rightScan int64, leftPrefix, rightPrefix string) (compareResult, error) {
-	cte, args := entryCTEs(leftScan, rightScan, leftPrefix, rightPrefix)
+func compareByContent(ctx context.Context, db *sql.DB, leftScan, rightScan int64, leftPrefix, rightPrefix string, ignoreCommonOS bool) (compareResult, error) {
+	cte, args := entryCTEs(leftScan, rightScan, leftPrefix, rightPrefix, ignoreCommonOS)
 
 	var result compareResult
 

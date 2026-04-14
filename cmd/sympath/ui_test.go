@@ -157,20 +157,40 @@ func insertUITestEntry(t *testing.T, db *sql.DB, scanID int64, relPath string, s
 	}
 }
 
+func compareHasEntry(entries []fileEntry, relPath string) bool {
+	for _, entry := range entries {
+		if entry.RelPath == relPath {
+			return true
+		}
+	}
+	return false
+}
+
+func compareHasDiff(diffs []fileDiffPair, relPath string) bool {
+	for _, diff := range diffs {
+		if diff.RelPath == relPath {
+			return true
+		}
+	}
+	return false
+}
+
 func TestEntryCTEsBranching(t *testing.T) {
 	tests := []struct {
-		name        string
-		leftPrefix  string
-		rightPrefix string
-		wantArgs    []any
-		wantSQL     []string
-		wantNoSQL   []string
+		name           string
+		leftPrefix     string
+		rightPrefix    string
+		ignoreCommonOS bool
+		wantArgs       []any
+		wantSQL        []string
+		wantNoSQL      []string
 	}{
 		{
-			name:        "empty prefixes keep raw paths",
-			leftPrefix:  "",
-			rightPrefix: "",
-			wantArgs:    []any{int64(11), int64(22)},
+			name:           "empty prefixes keep raw paths",
+			leftPrefix:     "",
+			rightPrefix:    "",
+			ignoreCommonOS: false,
+			wantArgs:       []any{int64(11), int64(22)},
 			wantSQL: []string{
 				"SELECT rel_path AS join_path, rel_path, size, sha256",
 			},
@@ -180,10 +200,11 @@ func TestEntryCTEsBranching(t *testing.T) {
 			},
 		},
 		{
-			name:        "equal non-empty prefixes join on raw path",
-			leftPrefix:  "sub",
-			rightPrefix: "sub",
-			wantArgs:    []any{5, int64(11), "sub/", "sub/", 5, int64(22), "sub/", "sub/"},
+			name:           "equal non-empty prefixes join on raw path",
+			leftPrefix:     "sub",
+			rightPrefix:    "sub",
+			ignoreCommonOS: false,
+			wantArgs:       []any{5, int64(11), "sub/", "sub/", 5, int64(22), "sub/", "sub/"},
 			wantSQL: []string{
 				"rel_path AS join_path,",
 				"rel_path < ? || x'FF'",
@@ -193,20 +214,34 @@ func TestEntryCTEsBranching(t *testing.T) {
 			},
 		},
 		{
-			name:        "different non-empty prefixes join on trimmed path",
-			leftPrefix:  "left",
-			rightPrefix: "right",
-			wantArgs:    []any{6, 6, int64(11), "left/", "left/", 7, 7, int64(22), "right/", "right/"},
+			name:           "different non-empty prefixes join on trimmed path",
+			leftPrefix:     "left",
+			rightPrefix:    "right",
+			ignoreCommonOS: false,
+			wantArgs:       []any{6, 6, int64(11), "left/", "left/", 7, 7, int64(22), "right/", "right/"},
 			wantSQL: []string{
 				"SUBSTR(rel_path, ?) AS join_path",
 				"rel_path < ? || x'FF'",
+			},
+		},
+		{
+			name:           "ignore common os metadata filters both sides",
+			leftPrefix:     "",
+			rightPrefix:    "",
+			ignoreCommonOS: true,
+			wantArgs: []any{
+				int64(11), ".ds_store", "thumbs.db", "ehthumbs.db", "desktop.ini", ".directory",
+				int64(22), ".ds_store", "thumbs.db", "ehthumbs.db", "desktop.ini", ".directory",
+			},
+			wantSQL: []string{
+				"LOWER(name) NOT IN (?, ?, ?, ?, ?)",
 			},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cte, args := entryCTEs(11, 22, tc.leftPrefix, tc.rightPrefix)
+			cte, args := entryCTEs(11, 22, tc.leftPrefix, tc.rightPrefix, tc.ignoreCommonOS)
 
 			if !reflect.DeepEqual(args, tc.wantArgs) {
 				t.Fatalf("unexpected args:\n got: %#v\nwant: %#v", args, tc.wantArgs)
@@ -501,8 +536,17 @@ func TestEmbeddedUIIncludesStatusMountAndExplicitCompareAction(t *testing.T) {
 	if !strings.Contains(html, "id=\"compare-button\"") {
 		t.Fatalf("expected explicit compare button in embedded UI, got:\n%s", html)
 	}
+	if !strings.Contains(html, "id=\"ignore-common-os\" checked") {
+		t.Fatalf("expected checked common OS ignore toggle in embedded UI, got:\n%s", html)
+	}
 	if !strings.Contains(html, "compareButton.addEventListener('click', compare)") {
 		t.Fatalf("expected compare button click handler in embedded UI, got:\n%s", html)
+	}
+	if !strings.Contains(html, "ignoreCommonOSBox.addEventListener('change', markCompareDirty)") {
+		t.Fatalf("expected common OS ignore toggle to dirty compare state, got:\n%s", html)
+	}
+	if !strings.Contains(html, "params.set('ignore_common_os', '1')") {
+		t.Fatalf("expected compare requests to include ignore_common_os flag, got:\n%s", html)
 	}
 	if strings.Contains(html, "setTimeout(compare, 400)") {
 		t.Fatalf("expected compare to be manually triggered, found auto-compare debounce in embedded UI:\n%s", html)
@@ -941,6 +985,165 @@ func TestHandleCompareByContentWithPrefix(t *testing.T) {
 	}
 	if len(result.LeftOnly) != 1 {
 		t.Fatalf("expected 1 left-only by content with prefix, got %d: %v", len(result.LeftOnly), result.LeftOnly)
+	}
+}
+
+func TestHandleCompareWithoutIgnoreCommonOSIncludesMetadataFiles(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	leftScan := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	rightScan := resolveUITestScanID(t, db, "machine-b", "/data/photos")
+
+	insertUITestEntry(t, db, leftScan, ".DS_Store", 10, "left-ds")
+	insertUITestEntry(t, db, rightScan, "Thumbs.db", 20, "right-thumbs")
+	insertUITestEntry(t, db, leftScan, "Desktop.ini", 30, "left-desktop")
+	insertUITestEntry(t, db, rightScan, "Desktop.ini", 40, "right-desktop")
+
+	req := httptest.NewRequest("GET", "/api/compare?left_machine=machine-a&left_root=/data/photos&right_machine=machine-b&right_root=/data/photos", nil)
+	rec := httptest.NewRecorder()
+	srv.handleCompare(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result compareResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if !compareHasEntry(result.LeftOnly, ".DS_Store") {
+		t.Fatalf("expected .DS_Store in left-only results, got %v", result.LeftOnly)
+	}
+	if !compareHasEntry(result.RightOnly, "Thumbs.db") {
+		t.Fatalf("expected Thumbs.db in right-only results, got %v", result.RightOnly)
+	}
+	if !compareHasDiff(result.Different, "Desktop.ini") {
+		t.Fatalf("expected Desktop.ini in different results, got %v", result.Different)
+	}
+}
+
+func TestHandleCompareIgnoreCommonOSFiltersPathResults(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	leftScan := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	rightScan := resolveUITestScanID(t, db, "machine-b", "/data/photos")
+
+	insertUITestEntry(t, db, leftScan, ".DS_Store", 10, "left-ds")
+	insertUITestEntry(t, db, rightScan, "THUMBS.DB", 20, "right-thumbs")
+	insertUITestEntry(t, db, leftScan, "Desktop.ini", 30, "left-desktop")
+	insertUITestEntry(t, db, rightScan, "Desktop.ini", 40, "right-desktop")
+
+	req := httptest.NewRequest("GET", "/api/compare?left_machine=machine-a&left_root=/data/photos&right_machine=machine-b&right_root=/data/photos&ignore_common_os=1", nil)
+	rec := httptest.NewRecorder()
+	srv.handleCompare(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result compareResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if result.IdenticalCount != 3 {
+		t.Fatalf("expected baseline identical count with ignored metadata, got %d", result.IdenticalCount)
+	}
+	if len(result.LeftOnly) != 2 {
+		t.Fatalf("expected baseline left-only count with ignored metadata, got %d: %v", len(result.LeftOnly), result.LeftOnly)
+	}
+	if len(result.RightOnly) != 2 {
+		t.Fatalf("expected baseline right-only count with ignored metadata, got %d: %v", len(result.RightOnly), result.RightOnly)
+	}
+	if len(result.Different) != 1 {
+		t.Fatalf("expected baseline different count with ignored metadata, got %d: %v", len(result.Different), result.Different)
+	}
+	if compareHasEntry(result.LeftOnly, ".DS_Store") || compareHasEntry(result.RightOnly, "THUMBS.DB") || compareHasDiff(result.Different, "Desktop.ini") {
+		t.Fatalf("expected ignored metadata to be removed, got left=%v right=%v diff=%v", result.LeftOnly, result.RightOnly, result.Different)
+	}
+}
+
+func TestHandleCompareIgnoreCommonOSFiltersContentResults(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	leftScan := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	rightScan := resolveUITestScanID(t, db, "machine-b", "/data/photos")
+
+	insertUITestEntry(t, db, leftScan, ".DS_Store", 10, "shared-ds")
+	insertUITestEntry(t, db, rightScan, ".DS_Store", 10, "shared-ds")
+	insertUITestEntry(t, db, leftScan, "Thumbs.db", 20, "left-thumbs")
+	insertUITestEntry(t, db, rightScan, "Desktop.ini", 30, "right-desktop")
+
+	req := httptest.NewRequest("GET", "/api/compare?left_machine=machine-a&left_root=/data/photos&right_machine=machine-b&right_root=/data/photos&by_content=1&ignore_common_os=1", nil)
+	rec := httptest.NewRecorder()
+	srv.handleCompare(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result compareResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if result.IdenticalCount != 3 {
+		t.Fatalf("expected baseline identical-by-content count with ignored metadata, got %d", result.IdenticalCount)
+	}
+	if len(result.LeftOnly) != 3 {
+		t.Fatalf("expected baseline left-only-by-content count with ignored metadata, got %d: %v", len(result.LeftOnly), result.LeftOnly)
+	}
+	if len(result.RightOnly) != 3 {
+		t.Fatalf("expected baseline right-only-by-content count with ignored metadata, got %d: %v", len(result.RightOnly), result.RightOnly)
+	}
+	if len(result.Different) != 0 {
+		t.Fatalf("expected no different bucket in content mode, got %v", result.Different)
+	}
+	if compareHasEntry(result.LeftOnly, "Thumbs.db") || compareHasEntry(result.RightOnly, "Desktop.ini") {
+		t.Fatalf("expected ignored metadata to be removed from content compare, got left=%v right=%v", result.LeftOnly, result.RightOnly)
+	}
+}
+
+func TestHandleCompareIgnoreCommonOSFiltersPrefixResults(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	leftScan := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	rightScan := resolveUITestScanID(t, db, "machine-b", "/data/photos")
+
+	insertUITestEntry(t, db, leftScan, "sub/.directory", 10, "left-directory")
+	insertUITestEntry(t, db, rightScan, "sub/Desktop.ini", 20, "right-desktop")
+	insertUITestEntry(t, db, leftScan, "sub/Thumbs.db", 30, "left-thumbs")
+	insertUITestEntry(t, db, rightScan, "sub/Thumbs.db", 40, "right-thumbs")
+
+	req := httptest.NewRequest("GET", "/api/compare?left_machine=machine-a&left_root=/data/photos&right_machine=machine-b&right_root=/data/photos&left_prefix=sub&right_prefix=sub&ignore_common_os=1", nil)
+	rec := httptest.NewRecorder()
+	srv.handleCompare(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result compareResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if result.IdenticalCount != 2 {
+		t.Fatalf("expected baseline identical count in sub/ with ignored metadata, got %d", result.IdenticalCount)
+	}
+	if len(result.LeftOnly) != 1 || result.LeftOnly[0].RelPath != "only-a.txt" {
+		t.Fatalf("expected only-a.txt as the sole left-only result in sub/, got %v", result.LeftOnly)
+	}
+	if len(result.RightOnly) != 1 || result.RightOnly[0].RelPath != "only-b.txt" {
+		t.Fatalf("expected only-b.txt as the sole right-only result in sub/, got %v", result.RightOnly)
+	}
+	if len(result.Different) != 0 {
+		t.Fatalf("expected no different results in sub/ after ignoring metadata, got %v", result.Different)
 	}
 }
 
