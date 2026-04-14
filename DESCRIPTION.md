@@ -366,6 +366,34 @@ delete.
 Critically, delete decisions are only derived from completed scans, never
 from partial or in-progress scans.
 
+## Database Retention and Space Reuse
+
+The database is designed to avoid unbounded scan-history growth.
+
+- For local scans, a successful publish keeps exactly one completed scan per
+  `(machine_id, root)`. Older completed scans for that root are deleted
+  immediately, and their `entries` rows are removed via `ON DELETE CASCADE`.
+- Failed or interrupted scans are kept only as a temporary reuse source for
+  the next scan of the same root. They remain non-authoritative and are
+  deleted by the next successful publish for that root.
+- In consolidated databases, repeated imports replace the existing
+  authoritative snapshot for the same `(machine_id, root)` instead of stacking
+  duplicate historical scans.
+- If a remote is removed from the aggregator's `remotes` file, that remote's
+  previously imported machine data is purged on the next successful
+  consolidation run.
+
+This means scan rows are cleaned up logically, but SQLite may still keep the
+database file at its current size on disk. Deleted rows free pages for reuse
+by future scans, but the file does not necessarily shrink immediately.
+
+`sympath` currently does not run `VACUUM` automatically. That is intentional:
+`VACUUM` rewrites the whole database, which can be expensive for large
+inventories and is not something we want on the hot path of ordinary scans.
+If reclaiming disk space becomes important for long-lived databases, an
+explicit maintenance command would be a better fit than vacuuming after every
+scan.
+
 ## Open Areas for Future Work
 
 - **Bidirectional sync**: The current design assumes one-way (source of
