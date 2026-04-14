@@ -17,10 +17,11 @@ type MachineIdentity struct {
 	Hostname  string
 }
 
-// PrevEntry holds the subset of a previous scan's entry needed for reuse
+// PrevEntry holds the subset of a reusable scan entry needed for reuse
 // decisions during the walk phase. If a file's Size and MtimeNS match
-// the previous scan, its Fingerprint and SHA256 are copied forward
-// without re-reading the file.
+// an exact previous entry or a trusted overlapping authoritative entry,
+// its Fingerprint and SHA256 are copied forward without re-reading the
+// file.
 type PrevEntry struct {
 	Size        int64
 	MtimeNS     int64

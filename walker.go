@@ -9,9 +9,9 @@ package inventory
 //     (rel_path, name, ext, size, mtime_ns) and an initial state.
 //   - jobCh: a HashJob for every file whose content needs hashing.
 //
-// For each file, the walker makes a reuse decision by comparing (size,
-// mtime_ns) against the previous scan's entries. If both match, the
-// file is emitted as state="reused" with the previous hashes copied in,
+// For each file, the walker first checks exact-root reuse and then any
+// overlapping-root reuse candidates. If a matching candidate is found,
+// the file is emitted as state="reused" with the stored hashes copied in,
 // and no HashJob is enqueued — skipping the expensive I/O + SHA-256.
 //
 // Files that fail the reuse check are emitted as state="pending" and a
@@ -36,16 +36,17 @@ import (
 // emitting a baseEntry on entryCh for every regular file encountered and a
 // HashJob on jobCh for files that need content hashing.
 //
-// The reuse decision compares each file's (size, mtime_ns) against
-// prevEntries. Matching files are emitted as state="reused" with hashes
-// copied from the previous scan; non-matching files are emitted as
+// The reuse decision compares each file's (size, mtime_ns) against the
+// exact-root previous scan and then any overlapping authoritative scans.
+// Matching files are emitted as state="reused" with hashes copied from a
+// reuse source; non-matching files are emitted as
 // state="pending" with a HashJob enqueued.
 //
 // The caller must close entryCh and jobCh after runWalker returns.
 func runWalker(
 	ctx context.Context,
 	root string,
-	prevEntries map[string]PrevEntry,
+	reuse *reuseSources,
 	excludeSet map[string]struct{},
 	entryCh chan<- baseEntry,
 	jobCh chan<- HashJob,
@@ -119,23 +120,25 @@ func runWalker(
 		size := info.Size()
 		mtimeNS := info.ModTime().UnixNano()
 
-		// Check if we can reuse the previous scan's hashes
-		if prev, ok := prevEntries[rel]; ok {
-			if prev.Size == size && prev.MtimeNS == mtimeNS {
-				entry := baseEntry{
-					RelPath:     rel,
-					Name:        name,
-					Ext:         ext,
-					Size:        size,
-					MtimeNS:     mtimeNS,
-					State:       "reused",
-					Fingerprint: prev.Fingerprint,
-					SHA256:      prev.SHA256,
-				}
-				entryCh <- entry
-				progress.noteDiscovered(entry.State)
-				return nil
+		// Check if we can reuse hashes from an exact or overlapping scan.
+		prev, ok, err := reuse.lookup(rel, size, mtimeNS)
+		if err != nil {
+			return err
+		}
+		if ok {
+			entry := baseEntry{
+				RelPath:     rel,
+				Name:        name,
+				Ext:         ext,
+				Size:        size,
+				MtimeNS:     mtimeNS,
+				State:       "reused",
+				Fingerprint: prev.Fingerprint,
+				SHA256:      prev.SHA256,
 			}
+			entryCh <- entry
+			progress.noteDiscovered(entry.State)
+			return nil
 		}
 
 		// File needs hashing

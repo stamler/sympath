@@ -12,7 +12,7 @@ package inventory
 // Orchestration proceeds in these phases:
 //
 //  1. Setup: resolve root path, configure DB connection, ensure schema,
-//     detect DB file for exclusion, load previous scan entries, detect
+//     detect DB file for exclusion, load exact-root reuse data, detect
 //     volume info (filesystem type and case sensitivity).
 //  2. Pipeline: launch walker, N hash workers, and writer goroutines
 //     connected by buffered channels.
@@ -41,8 +41,10 @@ import (
 // leaves the previous scan intact.
 //
 // Subsequent calls reuse fingerprints and SHA-256 hashes from the
-// previous scan when a file's (size, mtime_ns) are unchanged, making
-// re-scans of mostly-static trees very fast.
+// previous scan for the same root and, on exact misses, can fall back to
+// overlapping authoritative scans on the same machine when a file's
+// (size, mtime_ns) are unchanged, making re-scans of mostly-static
+// trees very fast.
 //
 // The pipeline uses min(NumCPU, 4) hash workers to avoid disk thrashing
 // while still saturating SHA-256 throughput on fast storage.
@@ -75,7 +77,7 @@ func InventoryTreeWithProgress(ctx context.Context, db *sql.DB, root string, pro
 	}
 	excludeSet := makeExcludeSet(dbPath)
 
-	// Load previous scan entries for reuse
+	// Load reuse sources for exact-root and overlapping-root reuse.
 	prevScanID, err := getCurrentScanID(ctx, db, identity.MachineID, absRoot)
 	if err != nil {
 		return err
@@ -83,6 +85,12 @@ func InventoryTreeWithProgress(ctx context.Context, db *sql.DB, root string, pro
 	prevEntries, err := loadPreviousEntries(ctx, db, prevScanID)
 	if err != nil {
 		return err
+	}
+	reuse := &reuseSources{
+		exact: prevEntries,
+		loadOverlap: func() (overlapReuseIndex, error) {
+			return loadOverlapReuseIndex(ctx, db, identity.MachineID, absRoot)
+		},
 	}
 
 	// Detect volume info
@@ -124,7 +132,7 @@ func InventoryTreeWithProgress(ctx context.Context, db *sql.DB, root string, pro
 
 	// Start walker
 	go func() {
-		walkerErr = runWalker(ctx, absRoot, prevEntries, excludeSet, entryCh, jobCh, progress)
+		walkerErr = runWalker(ctx, absRoot, reuse, excludeSet, entryCh, jobCh, progress)
 		progress.noteWalkComplete()
 		close(entryCh)
 		close(jobCh)
@@ -191,17 +199,9 @@ func loadPreviousEntries(ctx context.Context, db *sql.DB, scanID int64) (map[str
 
 	entries := make(map[string]PrevEntry)
 	for rows.Next() {
-		var relPath string
-		var pe PrevEntry
-		var fp, hash sql.NullString
-		if err := rows.Scan(&relPath, &pe.Size, &pe.MtimeNS, &fp, &hash); err != nil {
+		relPath, pe, err := scanPrevEntry(rows)
+		if err != nil {
 			return nil, err
-		}
-		if fp.Valid {
-			pe.Fingerprint = fp.String
-		}
-		if hash.Valid {
-			pe.SHA256 = hash.String
 		}
 		entries[relPath] = pe
 	}

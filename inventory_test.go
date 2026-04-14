@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -69,6 +70,115 @@ func getEntryState(t *testing.T, db *sql.DB, root, relPath string) string {
 		t.Fatal(err)
 	}
 	return state
+}
+
+func currentScanID(t *testing.T, db *sql.DB, root string) int64 {
+	t.Helper()
+	var scanID int64
+	if err := db.QueryRow("SELECT current_scan_id FROM roots WHERE root = ?", root).Scan(&scanID); err != nil {
+		t.Fatal(err)
+	}
+	return scanID
+}
+
+func updateEntryHashes(t *testing.T, db *sql.DB, scanID int64, relPath, fingerprint, sha256 string) {
+	t.Helper()
+	updateEntryResult(t, db, scanID, relPath, "ok", fingerprint, sha256)
+}
+
+func updateEntryResult(t *testing.T, db *sql.DB, scanID int64, relPath, state, fingerprint, sha256 string) {
+	t.Helper()
+	result, err := db.Exec(
+		"UPDATE entries SET state = ?, fingerprint = ?, sha256 = ? WHERE scan_id = ? AND rel_path = ?",
+		state, fingerprint, sha256, scanID, relPath,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if affected != 1 {
+		t.Fatalf("expected 1 updated entry for scan %d path %q, got %d", scanID, relPath, affected)
+	}
+}
+
+func TestReuseSources_DoesNotLoadOverlapWhenExactMatches(t *testing.T) {
+	called := false
+	expected := PrevEntry{
+		Size:        5,
+		MtimeNS:     7,
+		Fingerprint: "fp",
+		SHA256:      "sha",
+	}
+	reuse := &reuseSources{
+		exact: map[string]PrevEntry{"file.txt": expected},
+		loadOverlap: func() (overlapReuseIndex, error) {
+			called = true
+			return overlapReuseIndex{
+				"file.txt": {{PrevEntry: PrevEntry{Size: 5, MtimeNS: 7, Fingerprint: "other-fp", SHA256: "other-sha"}}},
+			}, nil
+		},
+	}
+
+	prev, ok, err := reuse.lookup("file.txt", 5, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected exact-root reuse hit")
+	}
+	if called {
+		t.Fatal("expected exact-root hit to skip overlap loading")
+	}
+	if prev != expected {
+		t.Fatalf("expected %+v, got %+v", expected, prev)
+	}
+}
+
+func TestReuseSources_LoadsOverlapOnExactMiss(t *testing.T) {
+	calls := 0
+	expected := PrevEntry{
+		Size:        5,
+		MtimeNS:     7,
+		Fingerprint: "fp",
+		SHA256:      "sha",
+	}
+	reuse := &reuseSources{
+		exact: map[string]PrevEntry{},
+		loadOverlap: func() (overlapReuseIndex, error) {
+			calls++
+			return overlapReuseIndex{
+				"file.txt": {{PrevEntry: expected}},
+			}, nil
+		},
+	}
+
+	prev, ok, err := reuse.lookup("file.txt", 5, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected overlap reuse hit")
+	}
+	if prev != expected {
+		t.Fatalf("expected %+v, got %+v", expected, prev)
+	}
+
+	prev, ok, err = reuse.lookup("file.txt", 5, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected cached overlap reuse hit")
+	}
+	if prev != expected {
+		t.Fatalf("expected cached %+v, got %+v", expected, prev)
+	}
+	if calls != 1 {
+		t.Fatalf("expected overlap loader to run once, got %d", calls)
+	}
 }
 
 func TestInventoryTree_FirstScan(t *testing.T) {
@@ -212,6 +322,195 @@ func TestInventoryTree_FileModified(t *testing.T) {
 	state = getEntryState(t, db, absRoot, "modified.txt")
 	if state != "ok" {
 		t.Errorf("modified.txt: expected ok, got %s", state)
+	}
+}
+
+func TestInventoryTree_OverlapReuseParentFromChild(t *testing.T) {
+	dir := t.TempDir()
+	scanDir := filepath.Join(dir, "data")
+	childDir := filepath.Join(scanDir, "raw")
+
+	createTestTree(t, scanDir, map[string]string{
+		"top.txt":             "top-level",
+		"raw/photo.jpg":       "photo",
+		"raw/nested/file.txt": "nested",
+	})
+
+	db := openTestDB(t, dir)
+	ctx := context.Background()
+	absRoot, _ := resolveAbsPath(scanDir)
+
+	if err := InventoryTree(ctx, db, childDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := InventoryTree(ctx, db, scanDir); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, rel := range []string{"raw/photo.jpg", "raw/nested/file.txt"} {
+		if state := getEntryState(t, db, absRoot, rel); state != "reused" {
+			t.Errorf("%s: expected reused from child overlap, got %s", rel, state)
+		}
+	}
+	if state := getEntryState(t, db, absRoot, "top.txt"); state != "ok" {
+		t.Errorf("top.txt: expected ok outside overlap, got %s", state)
+	}
+}
+
+func TestInventoryTree_OverlapReuseChildFromParent(t *testing.T) {
+	dir := t.TempDir()
+	scanDir := filepath.Join(dir, "data")
+	childDir := filepath.Join(scanDir, "raw")
+
+	createTestTree(t, scanDir, map[string]string{
+		"raw/photo.jpg":       "photo",
+		"raw/nested/file.txt": "nested",
+	})
+
+	db := openTestDB(t, dir)
+	ctx := context.Background()
+	absChild, _ := resolveAbsPath(childDir)
+
+	if err := InventoryTree(ctx, db, scanDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := InventoryTree(ctx, db, childDir); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, rel := range []string{"photo.jpg", "nested/file.txt"} {
+		if state := getEntryState(t, db, absChild, rel); state != "reused" {
+			t.Errorf("%s: expected reused from parent overlap, got %s", rel, state)
+		}
+	}
+}
+
+func TestInventoryTree_OverlapReuseExactRootStaleOverlapFresh(t *testing.T) {
+	dir := t.TempDir()
+	scanDir := filepath.Join(dir, "data")
+	childDir := filepath.Join(scanDir, "raw")
+
+	createTestTree(t, scanDir, map[string]string{
+		"top.txt":       "stable",
+		"raw/photo.jpg": "old-version",
+	})
+
+	db := openTestDB(t, dir)
+	ctx := context.Background()
+	absRoot, _ := resolveAbsPath(scanDir)
+
+	if err := InventoryTree(ctx, db, scanDir); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(childDir, "photo.jpg"), []byte("new-version"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := InventoryTree(ctx, db, childDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := InventoryTree(ctx, db, scanDir); err != nil {
+		t.Fatal(err)
+	}
+
+	if state := getEntryState(t, db, absRoot, "raw/photo.jpg"); state != "reused" {
+		t.Errorf("raw/photo.jpg: expected reused from fresher child overlap, got %s", state)
+	}
+	if state := getEntryState(t, db, absRoot, "top.txt"); state != "reused" {
+		t.Errorf("top.txt: expected exact-root reuse, got %s", state)
+	}
+}
+
+func TestInventoryTree_OverlapReuseConflictFallsBackToHash(t *testing.T) {
+	dir := t.TempDir()
+	scanDir := filepath.Join(dir, "data")
+	targetDir := filepath.Join(scanDir, "raw")
+	descendantDir := filepath.Join(targetDir, "nested")
+
+	createTestTree(t, scanDir, map[string]string{
+		"raw/nested/file.txt": "shared-content",
+	})
+
+	db := openTestDB(t, dir)
+	ctx := context.Background()
+	absAncestor, _ := resolveAbsPath(scanDir)
+	absTarget, _ := resolveAbsPath(targetDir)
+	absDescendant, _ := resolveAbsPath(descendantDir)
+
+	if err := InventoryTree(ctx, db, scanDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := InventoryTree(ctx, db, descendantDir); err != nil {
+		t.Fatal(err)
+	}
+
+	updateEntryHashes(t, db, currentScanID(t, db, absAncestor), "raw/nested/file.txt", strings.Repeat("a", 64), strings.Repeat("b", 64))
+	updateEntryHashes(t, db, currentScanID(t, db, absDescendant), "file.txt", strings.Repeat("c", 64), strings.Repeat("d", 64))
+
+	if err := InventoryTree(ctx, db, targetDir); err != nil {
+		t.Fatal(err)
+	}
+
+	if state := getEntryState(t, db, absTarget, "nested/file.txt"); state != "ok" {
+		t.Errorf("nested/file.txt: expected ok after overlap conflict, got %s", state)
+	}
+}
+
+func TestInventoryTree_OverlapReuseIgnoresUntrustedSourceEntries(t *testing.T) {
+	dir := t.TempDir()
+	scanDir := filepath.Join(dir, "data")
+	childDir := filepath.Join(scanDir, "raw")
+
+	createTestTree(t, scanDir, map[string]string{
+		"raw/photo.jpg": "photo",
+	})
+
+	db := openTestDB(t, dir)
+	ctx := context.Background()
+	absRoot, _ := resolveAbsPath(scanDir)
+	absChild, _ := resolveAbsPath(childDir)
+
+	if err := InventoryTree(ctx, db, childDir); err != nil {
+		t.Fatal(err)
+	}
+
+	updateEntryResult(t, db, currentScanID(t, db, absChild), "photo.jpg", "error", "", "")
+
+	if err := InventoryTree(ctx, db, scanDir); err != nil {
+		t.Fatal(err)
+	}
+
+	if state := getEntryState(t, db, absRoot, "raw/photo.jpg"); state != "ok" {
+		t.Errorf("raw/photo.jpg: expected ok when overlap source is untrusted, got %s", state)
+	}
+}
+
+func TestInventoryTree_OverlapReuseIgnoresNonOverlappingPrefixRoots(t *testing.T) {
+	dir := t.TempDir()
+	scanDir := filepath.Join(dir, "data")
+	targetDir := filepath.Join(scanDir, "raw")
+	otherDir := filepath.Join(scanDir, "raw-archive")
+
+	createTestTree(t, scanDir, map[string]string{
+		"raw/file.txt":         "shared",
+		"raw-archive/file.txt": "shared",
+	})
+
+	db := openTestDB(t, dir)
+	ctx := context.Background()
+	absTarget, _ := resolveAbsPath(targetDir)
+
+	if err := InventoryTree(ctx, db, otherDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := InventoryTree(ctx, db, targetDir); err != nil {
+		t.Fatal(err)
+	}
+
+	if state := getEntryState(t, db, absTarget, "file.txt"); state != "ok" {
+		t.Errorf("file.txt: expected ok for non-overlapping prefix root, got %s", state)
 	}
 }
 

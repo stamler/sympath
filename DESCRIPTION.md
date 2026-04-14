@@ -39,9 +39,10 @@ also renders a live in-place scan progress line with an ASCII spinner,
 a bouncing track, and running file counts.
 
 Each call produces a complete snapshot of every regular file under `root`.
-Subsequent calls reuse hashes from the previous snapshot when a file's size
-and modification time are unchanged, making re-scans of mostly-static trees
-very fast.
+Subsequent calls first reuse hashes from the previous snapshot for that exact
+root and can also fall back to overlapping authoritative scans on the same
+machine when a file's size and modification time are unchanged, making
+re-scans of mostly-static trees very fast.
 
 ## Design Principles
 
@@ -82,18 +83,22 @@ Walker (1 goroutine)
 
 ### Incremental Reuse
 
-Before starting a new scan the previous scan's entries are preloaded into an
-in-memory map keyed by relative path. During the walk, if a file's `(size,
-mtime_ns)` match the previous entry, its fingerprint and SHA-256 are copied
-directly into the new scan and the file is not re-read. On a tree where 90%
-of files are unchanged, this skips 90% of disk I/O.
+Before starting a new scan the exact previous scan's entries are preloaded into
+an in-memory map keyed by relative path. During the walk, if a file's `(size,
+mtime_ns)` match the exact previous entry, its fingerprint and SHA-256 are
+copied directly into the new scan and the file is not re-read. On an exact
+miss, the walker can lazily consult overlapping authoritative scans from the
+same machine by translating their relative paths into the target root's
+coordinate system. On a tree where 90% of files are unchanged, this skips 90%
+of disk I/O.
 
 ### Scan Lifecycle
 
 ```
-1. Read roots.current_scan_id -> preload previous entries
+1. Read roots.current_scan_id -> preload exact previous entries
 2. INSERT into scans (status = 'running')
-3. Walk tree, emit base entries + hash jobs
+3. Walk tree, reusing exact matches first and consulting overlapping
+   authoritative roots on same-machine misses; emit base entries + hash jobs
 4. Workers drain job queue, emit results
 5. Writer flushes all inserts and updates
 6. Publish (single short transaction):
@@ -181,7 +186,7 @@ Every entry row carries a `state` that indicates how its data was obtained:
 | State      | Meaning                                                |
 |------------|--------------------------------------------------------|
 | `ok`       | File was freshly read and hashed; hashes are valid.    |
-| `reused`   | Size and mtime matched the previous scan; hashes were copied without re-reading the file. |
+| `reused`   | Size and mtime matched an exact previous entry or a trusted overlapping authoritative scan; hashes were copied without re-reading the file. |
 | `unstable` | File changed between the pre-read stat and the post-read stat. Hashes are present but unreliable. Retried once before marking. |
 | `vanished` | File existed during discovery but was deleted before the hash worker could open it. No hashes. |
 | `error`    | An I/O or permission error prevented reading the file. The `err` column contains the message. |
@@ -249,9 +254,12 @@ inventory.go          InventoryTree orchestration, scan lifecycle, publish and g
   NVMe.
 - **Buffer reuse**: Each worker allocates a single 1MB read buffer at startup
   and reuses it across all files.
-- **Preloaded previous scan**: The entire previous scan's metadata is loaded
-  into a `map[string]PrevEntry` before the walk begins, making reuse lookups
+- **Exact-root fast path**: The previous scan for the same root is loaded into
+  a `map[string]PrevEntry` before the walk begins, making unchanged-file reuse
   O(1).
+- **Lazy overlap fallback**: Overlapping authoritative scans on the same
+  machine are only loaded after an exact-root miss, so ordinary rescans keep
+  the old fast path.
 - **Channel buffers**: 1000-element buffers on all three pipeline channels let
   the walker run ahead of the hash workers.
 
