@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 type compareResult struct {
@@ -59,26 +60,54 @@ func normalizePrefix(p string) string {
 func entryCTEs(leftScan, rightScan int64, leftPrefix, rightPrefix string) (string, []any) {
 	lp := normalizePrefix(leftPrefix)
 	rp := normalizePrefix(rightPrefix)
+	joinOnRawPath := lp != "" && lp == rp
 
-	cte := `
-		WITH left_entries AS (
+	leftCTE, leftArgs := filteredEntriesCTE("left_entries", leftScan, lp, joinOnRawPath)
+	rightCTE, rightArgs := filteredEntriesCTE("right_entries", rightScan, rp, joinOnRawPath)
+
+	return fmt.Sprintf(`
+		WITH %s,
+		%s`, leftCTE, rightCTE), append(leftArgs, rightArgs...)
+}
+
+func filteredEntriesCTE(name string, scanID int64, prefix string, joinOnRawPath bool) (string, []any) {
+	if prefix == "" {
+		return fmt.Sprintf(`%s AS (
+			SELECT rel_path AS join_path, rel_path, size, sha256
+			FROM entries
+			WHERE scan_id = ?
+		)`, name), []any{scanID}
+	}
+
+	// SQLite SUBSTR counts characters, not bytes, so this offset must
+	// use rune count to stay aligned with multibyte UTF-8 prefixes.
+	start := utf8.RuneCountInString(prefix) + 1
+	// SQLite's default BINARY collation compares TEXT byte-wise, so
+	// prefix || x'FF' is an exclusive upper bound for every UTF-8 path
+	// that begins with prefix.
+	if joinOnRawPath {
+		return fmt.Sprintf(`%s AS (
 			SELECT
-				CASE WHEN ?1 = '' THEN rel_path ELSE SUBSTR(rel_path, LENGTH(?1) + 1) END AS rel_path,
+				rel_path AS join_path,
+				SUBSTR(rel_path, ?) AS rel_path,
 				size, sha256
 			FROM entries
-			WHERE scan_id = ?2
-			  AND (?1 = '' OR SUBSTR(rel_path, 1, LENGTH(?1)) = ?1)
-		),
-		right_entries AS (
-			SELECT
-				CASE WHEN ?3 = '' THEN rel_path ELSE SUBSTR(rel_path, LENGTH(?3) + 1) END AS rel_path,
-				size, sha256
-			FROM entries
-			WHERE scan_id = ?4
-			  AND (?3 = '' OR SUBSTR(rel_path, 1, LENGTH(?3)) = ?3)
-		)`
+			WHERE scan_id = ?
+			  AND rel_path >= ?
+			  AND rel_path < ? || x'FF'
+		)`, name), []any{start, scanID, prefix, prefix}
+	}
 
-	return cte, []any{lp, leftScan, rp, rightScan}
+	return fmt.Sprintf(`%s AS (
+		SELECT
+			SUBSTR(rel_path, ?) AS join_path,
+			SUBSTR(rel_path, ?) AS rel_path,
+			size, sha256
+		FROM entries
+		WHERE scan_id = ?
+		  AND rel_path >= ?
+		  AND rel_path < ? || x'FF'
+	)`, name), []any{start, start, scanID, prefix, prefix}
 }
 
 func compareRoots(ctx context.Context, db *sql.DB, leftMachine, leftRoot, rightMachine, rightRoot, leftPrefix, rightPrefix string, byContent bool) (compareResult, error) {
@@ -106,7 +135,7 @@ func compareByPath(ctx context.Context, db *sql.DB, leftScan, rightScan int64, l
 	// Identical count.
 	err := db.QueryRowContext(ctx, cte+fmt.Sprintf(`
 		SELECT COUNT(*) FROM left_entries l
-		JOIN right_entries r ON l.rel_path = r.rel_path
+		JOIN right_entries r ON l.join_path = r.join_path
 		WHERE %s
 	`, identicalPredicate), args...).Scan(&result.IdenticalCount)
 	if err != nil {
@@ -131,7 +160,7 @@ func compareByPath(ctx context.Context, db *sql.DB, leftScan, rightScan int64, l
 		       l.size, COALESCE(l.sha256, ''),
 		       r.size, COALESCE(r.sha256, '')
 		FROM left_entries l
-		JOIN right_entries r ON l.rel_path = r.rel_path
+		JOIN right_entries r ON l.join_path = r.join_path
 		WHERE NOT (%s)
 		ORDER BY l.rel_path
 	`, identicalPredicate), args...)
@@ -296,8 +325,8 @@ func queryOnlyFilesCTE(ctx context.Context, db *sql.DB, cte string, args []any, 
 	query := fmt.Sprintf(cte+`
 		SELECT l.rel_path, l.size, COALESCE(l.sha256, '')
 		FROM %s l
-		LEFT JOIN %s r ON l.rel_path = r.rel_path
-		WHERE r.rel_path IS NULL
+		LEFT JOIN %s r ON l.join_path = r.join_path
+		WHERE r.join_path IS NULL
 		ORDER BY l.rel_path
 	`, present, absent)
 

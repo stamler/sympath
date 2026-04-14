@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -153,6 +154,74 @@ func insertUITestEntry(t *testing.T, db *sql.DB, scanID int64, relPath string, s
 		VALUES (?, ?, ?, ?, ?, 0, ?, 'ok')
 	`, scanID, relPath, name, ext, size, sha256); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestEntryCTEsBranching(t *testing.T) {
+	tests := []struct {
+		name        string
+		leftPrefix  string
+		rightPrefix string
+		wantArgs    []any
+		wantSQL     []string
+		wantNoSQL   []string
+	}{
+		{
+			name:        "empty prefixes keep raw paths",
+			leftPrefix:  "",
+			rightPrefix: "",
+			wantArgs:    []any{int64(11), int64(22)},
+			wantSQL: []string{
+				"SELECT rel_path AS join_path, rel_path, size, sha256",
+			},
+			wantNoSQL: []string{
+				"x'FF'",
+				"SUBSTR(rel_path, ?) AS join_path",
+			},
+		},
+		{
+			name:        "equal non-empty prefixes join on raw path",
+			leftPrefix:  "sub",
+			rightPrefix: "sub",
+			wantArgs:    []any{5, int64(11), "sub/", "sub/", 5, int64(22), "sub/", "sub/"},
+			wantSQL: []string{
+				"rel_path AS join_path,",
+				"rel_path < ? || x'FF'",
+			},
+			wantNoSQL: []string{
+				"SUBSTR(rel_path, ?) AS join_path",
+			},
+		},
+		{
+			name:        "different non-empty prefixes join on trimmed path",
+			leftPrefix:  "left",
+			rightPrefix: "right",
+			wantArgs:    []any{6, 6, int64(11), "left/", "left/", 7, 7, int64(22), "right/", "right/"},
+			wantSQL: []string{
+				"SUBSTR(rel_path, ?) AS join_path",
+				"rel_path < ? || x'FF'",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cte, args := entryCTEs(11, 22, tc.leftPrefix, tc.rightPrefix)
+
+			if !reflect.DeepEqual(args, tc.wantArgs) {
+				t.Fatalf("unexpected args:\n got: %#v\nwant: %#v", args, tc.wantArgs)
+			}
+			for _, fragment := range tc.wantSQL {
+				if !strings.Contains(cte, fragment) {
+					t.Fatalf("expected SQL fragment %q in:\n%s", fragment, cte)
+				}
+			}
+			for _, fragment := range tc.wantNoSQL {
+				if strings.Contains(cte, fragment) {
+					t.Fatalf("did not expect SQL fragment %q in:\n%s", fragment, cte)
+				}
+			}
+		})
 	}
 }
 
@@ -603,6 +672,91 @@ func TestHandleCompareWithPrefix(t *testing.T) {
 	// no different files in sub/
 	if len(result.Different) != 0 {
 		t.Fatalf("expected 0 different in sub/, got %d", len(result.Different))
+	}
+}
+
+func TestHandleCompareWithDifferentPrefixes(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	leftScan := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	rightScan := resolveUITestScanID(t, db, "machine-b", "/data/photos")
+
+	insertUITestEntry(t, db, leftScan, "leftprefix/shared.txt", 111, "shared-hash")
+	insertUITestEntry(t, db, rightScan, "rightprefix/shared.txt", 111, "shared-hash")
+	insertUITestEntry(t, db, leftScan, "leftprefix/different.txt", 222, "left-diff")
+	insertUITestEntry(t, db, rightScan, "rightprefix/different.txt", 333, "right-diff")
+	insertUITestEntry(t, db, leftScan, "leftprefix/left-only.txt", 444, "left-only")
+	insertUITestEntry(t, db, rightScan, "rightprefix/right-only.txt", 555, "right-only")
+
+	req := httptest.NewRequest("GET", "/api/compare?left_machine=machine-a&left_root=/data/photos&right_machine=machine-b&right_root=/data/photos&left_prefix=leftprefix&right_prefix=rightprefix", nil)
+	rec := httptest.NewRecorder()
+	srv.handleCompare(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result compareResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if result.IdenticalCount != 1 {
+		t.Fatalf("expected 1 identical across different prefixes, got %d", result.IdenticalCount)
+	}
+	if len(result.LeftOnly) != 1 || result.LeftOnly[0].RelPath != "left-only.txt" {
+		t.Fatalf("expected left-only.txt as the only left-only file, got %v", result.LeftOnly)
+	}
+	if len(result.RightOnly) != 1 || result.RightOnly[0].RelPath != "right-only.txt" {
+		t.Fatalf("expected right-only.txt as the only right-only file, got %v", result.RightOnly)
+	}
+	if len(result.Different) != 1 {
+		t.Fatalf("expected 1 different file across different prefixes, got %d", len(result.Different))
+	}
+	if result.Different[0].RelPath != "different.txt" {
+		t.Fatalf("expected different.txt with prefixes stripped, got %q", result.Different[0].RelPath)
+	}
+}
+
+func TestHandleCompareWithUnicodePrefixes(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	leftScan := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	rightScan := resolveUITestScanID(t, db, "machine-b", "/data/photos")
+
+	insertUITestEntry(t, db, leftScan, "Música/shared.txt", 111, "shared-hash")
+	insertUITestEntry(t, db, rightScan, "Éxitos/shared.txt", 111, "shared-hash")
+	insertUITestEntry(t, db, leftScan, "Música/different.txt", 222, "left-diff")
+	insertUITestEntry(t, db, rightScan, "Éxitos/different.txt", 333, "right-diff")
+	insertUITestEntry(t, db, leftScan, "Música/left-only.txt", 444, "left-only")
+	insertUITestEntry(t, db, rightScan, "Éxitos/right-only.txt", 555, "right-only")
+
+	req := httptest.NewRequest("GET", "/api/compare?left_machine=machine-a&left_root=/data/photos&right_machine=machine-b&right_root=/data/photos&left_prefix=Música&right_prefix=Éxitos", nil)
+	rec := httptest.NewRecorder()
+	srv.handleCompare(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result compareResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if result.IdenticalCount != 1 {
+		t.Fatalf("expected 1 identical across Unicode prefixes, got %d", result.IdenticalCount)
+	}
+	if len(result.LeftOnly) != 1 || result.LeftOnly[0].RelPath != "left-only.txt" {
+		t.Fatalf("expected left-only.txt as the only left-only file, got %v", result.LeftOnly)
+	}
+	if len(result.RightOnly) != 1 || result.RightOnly[0].RelPath != "right-only.txt" {
+		t.Fatalf("expected right-only.txt as the only right-only file, got %v", result.RightOnly)
+	}
+	if len(result.Different) != 1 || result.Different[0].RelPath != "different.txt" {
+		t.Fatalf("expected different.txt as the only different file, got %v", result.Different)
 	}
 }
 
