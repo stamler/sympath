@@ -16,7 +16,6 @@ const (
 	updateCheckCacheName = "update-check.json"
 	updateCheckTTL       = 24 * time.Hour
 	updateCheckTimeout   = 2 * time.Second
-	updateCheckAPIURL    = "https://api.github.com/repos/stamler/sympath/releases/latest"
 )
 
 type latestRelease struct {
@@ -340,7 +339,7 @@ func (v taggedVersion) lessThan(other taggedVersion) bool {
 }
 
 func fetchLatestGitHubRelease(ctx context.Context) (latestRelease, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, updateCheckAPIURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, latestReleaseAPIURL(), nil)
 	if err != nil {
 		return latestRelease{}, err
 	}

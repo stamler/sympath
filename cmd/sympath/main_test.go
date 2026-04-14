@@ -39,6 +39,9 @@ func TestPrintUsage_DoesNotMentionDBFlag(t *testing.T) {
 	if !strings.Contains(out, "sympath version") {
 		t.Fatalf("expected usage to mention version command, got:\n%s", out)
 	}
+	if !strings.Contains(out, "sympath update") {
+		t.Fatalf("expected usage to mention update command, got:\n%s", out)
+	}
 	if !strings.Contains(out, "sympath update-check") {
 		t.Fatalf("expected usage to mention update-check command, got:\n%s", out)
 	}
@@ -245,6 +248,234 @@ func TestRunWithIO_UpdateCheckCommandFailure(t *testing.T) {
 	}
 	if stdout.Len() != 0 {
 		t.Fatalf("expected no stdout on failure, got %q", stdout.String())
+	}
+}
+
+func TestRunWithIO_UpdateCommandUpToDate(t *testing.T) {
+	prevVersion := version
+	version = "v1.2.3"
+	t.Cleanup(func() { version = prevVersion })
+
+	prevChecker := newUpdateChecker
+	newUpdateChecker = func() updateChecker {
+		return updateChecker{
+			stateDir: func() (string, error) { return t.TempDir(), nil },
+			now:      time.Now,
+			fetchLatest: func(context.Context) (latestRelease, error) {
+				return latestRelease{
+					Version: "v1.2.3",
+					URL:     "https://example.com/releases/v1.2.3",
+				}, nil
+			},
+		}
+	}
+	t.Cleanup(func() { newUpdateChecker = prevChecker })
+
+	prevInstall := installManagedRelease
+	installManagedRelease = func(context.Context, string) (installedRelease, error) {
+		t.Fatal("expected no install when already up to date")
+		return installedRelease{}, nil
+	}
+	t.Cleanup(func() { installManagedRelease = prevInstall })
+
+	var stdout bytes.Buffer
+	if err := runWithIO([]string{"update"}, &stdout, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := stdout.String(); !strings.Contains(got, "v1.2.3 is up to date") {
+		t.Fatalf("expected up-to-date message, got %q", got)
+	}
+}
+
+func TestRunWithIO_UpdateCommandInstallsAvailableRelease(t *testing.T) {
+	prevVersion := version
+	version = "v1.2.3"
+	t.Cleanup(func() { version = prevVersion })
+
+	stateDir := t.TempDir()
+	prevChecker := newUpdateChecker
+	newUpdateChecker = func() updateChecker {
+		return updateChecker{
+			stateDir: func() (string, error) { return stateDir, nil },
+			now:      time.Now,
+			fetchLatest: func(context.Context) (latestRelease, error) {
+				return latestRelease{
+					Version: "v1.2.5",
+					URL:     "https://example.com/releases/v1.2.5",
+				}, nil
+			},
+		}
+	}
+	t.Cleanup(func() { newUpdateChecker = prevChecker })
+
+	capturedVersion := ""
+	prevInstall := installManagedRelease
+	installManagedRelease = func(_ context.Context, targetVersion string) (installedRelease, error) {
+		capturedVersion = targetVersion
+		return installedRelease{
+			Version:    "v1.2.5",
+			TargetPath: "/tmp/sympath",
+			ReleaseURL: "https://example.com/releases/v1.2.5",
+		}, nil
+	}
+	t.Cleanup(func() { installManagedRelease = prevInstall })
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := runWithIO([]string{"update"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	if capturedVersion != "v1.2.5" {
+		t.Fatalf("expected installer target version v1.2.5, got %q", capturedVersion)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "Updating sympath from v1.2.3 to v1.2.5") {
+		t.Fatalf("expected preflight output, got %q", out)
+	}
+	if !strings.Contains(out, "Installed sympath v1.2.5 to /tmp/sympath") {
+		t.Fatalf("expected install success output, got %q", out)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr output, got %q", stderr.String())
+	}
+
+	cachePath := filepath.Join(stateDir, updateCheckCacheName)
+	cacheData, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("expected cache file after update, got %v", err)
+	}
+	if !strings.Contains(string(cacheData), "v1.2.5") {
+		t.Fatalf("expected cache to mention installed version, got %q", string(cacheData))
+	}
+}
+
+func TestRunWithIO_UpdateCommandUsesRequestedInstallVersion(t *testing.T) {
+	prevVersion := version
+	version = "v1.2.3"
+	t.Cleanup(func() { version = prevVersion })
+	t.Setenv(installVersionEnv, "v1.2.4")
+
+	prevChecker := newUpdateChecker
+	newUpdateChecker = func() updateChecker {
+		return updateChecker{
+			stateDir: func() (string, error) { return t.TempDir(), nil },
+			now:      time.Now,
+			fetchLatest: func(context.Context) (latestRelease, error) {
+				t.Fatal("expected pinned install version to skip live release check")
+				return latestRelease{}, nil
+			},
+		}
+	}
+	t.Cleanup(func() { newUpdateChecker = prevChecker })
+
+	capturedVersion := ""
+	prevInstall := installManagedRelease
+	installManagedRelease = func(_ context.Context, targetVersion string) (installedRelease, error) {
+		capturedVersion = targetVersion
+		return installedRelease{
+			Version:    "v1.2.4",
+			TargetPath: "/tmp/sympath",
+			ReleaseURL: "https://example.com/releases/v1.2.4",
+		}, nil
+	}
+	t.Cleanup(func() { installManagedRelease = prevInstall })
+
+	if err := runWithIO([]string{"update"}, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if capturedVersion != "v1.2.4" {
+		t.Fatalf("expected explicit install version v1.2.4, got %q", capturedVersion)
+	}
+}
+
+func TestRunWithIO_UpdateCommandPinnedVersionDoesNotFailOnLiveCheck(t *testing.T) {
+	prevVersion := version
+	version = "v1.2.3"
+	t.Cleanup(func() { version = prevVersion })
+	t.Setenv(installVersionEnv, "v1.2.4")
+
+	prevChecker := newUpdateChecker
+	newUpdateChecker = func() updateChecker {
+		return updateChecker{
+			stateDir: func() (string, error) { return t.TempDir(), nil },
+			now:      time.Now,
+			fetchLatest: func(context.Context) (latestRelease, error) {
+				return latestRelease{}, errors.New("network unavailable")
+			},
+		}
+	}
+	t.Cleanup(func() { newUpdateChecker = prevChecker })
+
+	prevInstall := installManagedRelease
+	installManagedRelease = func(_ context.Context, targetVersion string) (installedRelease, error) {
+		return installedRelease{
+			Version:    targetVersion,
+			TargetPath: "/tmp/sympath",
+			ReleaseURL: "https://example.com/releases/" + targetVersion,
+		}, nil
+	}
+	t.Cleanup(func() { installManagedRelease = prevInstall })
+
+	if err := runWithIO([]string{"update"}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("expected pinned update to proceed without live check, got %v", err)
+	}
+}
+
+func TestRunWithIO_UpdateCommandRejectsUnsupportedBuild(t *testing.T) {
+	prevVersion := version
+	version = "dev"
+	t.Cleanup(func() { version = prevVersion })
+
+	prevInstall := installManagedRelease
+	installManagedRelease = func(context.Context, string) (installedRelease, error) {
+		t.Fatal("expected no install for unsupported build")
+		return installedRelease{}, nil
+	}
+	t.Cleanup(func() { installManagedRelease = prevInstall })
+
+	err := runWithIO([]string{"update"}, io.Discard, io.Discard)
+	if err == nil {
+		t.Fatal("expected unsupported build to fail")
+	}
+	if !strings.Contains(err.Error(), "sympath update is unavailable for build dev") {
+		t.Fatalf("expected unsupported-build error, got %v", err)
+	}
+}
+
+func TestRunWithIO_UpdateCommandReturnsInstallerFailure(t *testing.T) {
+	prevVersion := version
+	version = "v1.2.3"
+	t.Cleanup(func() { version = prevVersion })
+
+	prevChecker := newUpdateChecker
+	newUpdateChecker = func() updateChecker {
+		return updateChecker{
+			stateDir: func() (string, error) { return t.TempDir(), nil },
+			now:      time.Now,
+			fetchLatest: func(context.Context) (latestRelease, error) {
+				return latestRelease{
+					Version: "v1.2.5",
+					URL:     "https://example.com/releases/v1.2.5",
+				}, nil
+			},
+		}
+	}
+	t.Cleanup(func() { newUpdateChecker = prevChecker })
+
+	prevInstall := installManagedRelease
+	installManagedRelease = func(context.Context, string) (installedRelease, error) {
+		return installedRelease{}, errors.New("checksum verification failed")
+	}
+	t.Cleanup(func() { installManagedRelease = prevInstall })
+
+	err := runWithIO([]string{"update"}, io.Discard, io.Discard)
+	if err == nil {
+		t.Fatal("expected update to fail")
+	}
+	if !strings.Contains(err.Error(), "checksum verification failed") {
+		t.Fatalf("expected installer failure, got %v", err)
 	}
 }
 

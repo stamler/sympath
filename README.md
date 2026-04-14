@@ -20,6 +20,8 @@ Re-running either installer upgrades `sympath` to the latest GitHub release when
 
 Tagged release builds also cache the latest known GitHub release under `~/.sympath/update-check.json`. Successful `scan`, `ui`, and `version` commands may print a brief stderr-only notice when a newer release is already known, and `sympath update-check` forces a live refresh on demand.
 
+Managed installs can also upgrade themselves with `sympath update`. In v1, that command only updates the standard per-user install locations (or `SYMPATH_INSTALL_DIR` when explicitly set). If `sympath` is being run from an ad-hoc copied binary, it fails with guidance to reinstall via the documented installer.
+
 ## Supported Targets
 
 - macOS arm64
@@ -80,12 +82,15 @@ Set `VERSION=vX.Y.Z` to embed a specific release version in the binary.
 sympath scan /path/to/root
 sympath ui
 sympath version
+sympath update
 sympath update-check
 ```
 
 Running `sympath` without a subcommand behaves like `sympath scan`.
 
 `sympath version` keeps printing only the build version on stdout. When an update is known to be available, the automatic notice is written to stderr so scripts that read stdout stay stable.
+
+`sympath update` performs the actual managed in-place upgrade for supported per-user installs. `sympath update-check` remains the read-only command for checking release status without changing the installation.
 
 Interactive scans show a live progress line on `stderr` with a spinner,
 an ASCII bouncing track, and running file counts while the inventory is

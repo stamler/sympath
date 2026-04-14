@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -73,6 +74,8 @@ func runWithIO(args []string, stdout, stderr io.Writer) error {
 		return nil
 	case "-version", "--version", "version":
 		fmt.Fprintln(stdout, version)
+	case "update":
+		err = runUpdateWithIO(args[1:], stdout, stderr)
 	case "update-check":
 		err = runUpdateCheckWithIO(args[1:], stdout, stderr)
 	case "scan":
@@ -171,6 +174,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "  sympath scan [--verbose] [ROOT]\n")
 	fmt.Fprintf(w, "  sympath ui\n")
 	fmt.Fprintf(w, "  sympath version\n")
+	fmt.Fprintf(w, "  sympath update\n")
 	fmt.Fprintf(w, "  sympath update-check\n")
 	fmt.Fprintf(w, "  sympath [--verbose] [ROOT]\n\n")
 	fmt.Fprintf(w, "Scans ROOT into the consolidated SQLite inventory database in ~/.sympath.\n")
@@ -180,17 +184,21 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "The ui command consolidates local databases (skipping remote fetch), then\n")
 	fmt.Fprintf(w, "launches a web interface for comparing inventoried directory trees.\n")
 	fmt.Fprintf(w, "Use sympath version or sympath --version to print the build version.\n")
+	fmt.Fprintf(w, "Use sympath update to install a newer managed release in place.\n")
 	fmt.Fprintf(w, "Use sympath update-check to force a live release check.\n")
 	fmt.Fprintf(w, "Successful scan, ui, and version commands may print a brief stderr-only update notice.\n")
 }
 
 func shouldAutoCheck(args []string) bool {
+	if strings.TrimSpace(os.Getenv(internalNoUpdateEnv)) == "1" {
+		return false
+	}
 	if len(args) == 0 {
 		return true
 	}
 
 	switch args[0] {
-	case "-h", "--help", "help", "update-check":
+	case "-h", "--help", "help", "update", "update-check":
 		return false
 	default:
 		return true
@@ -221,6 +229,81 @@ func runUpdateCheckWithIO(args []string, stdout, stderr io.Writer) error {
 	}
 
 	fmt.Fprintln(stdout, formatUpdateCheckMessage(status))
+	return nil
+}
+
+func runUpdateWithIO(args []string, stdout, stderr io.Writer) error {
+	if len(args) > 0 {
+		return errors.New("update accepts no arguments")
+	}
+
+	if err := validateTaggedBuildVersion(version); err != nil {
+		return err
+	}
+
+	checker := newUpdateChecker().withDefaults()
+	targetVersion := requestedInstallVersion()
+	if targetVersion != "" {
+		if _, err := parseTaggedVersion(targetVersion); err != nil {
+			return fmt.Errorf("invalid %s %q: %w", installVersionEnv, targetVersion, err)
+		}
+		if targetVersion == version {
+			fmt.Fprintf(stdout, "%s is up to date\n", version)
+			return nil
+		}
+	} else {
+		statusCtx, cancel := context.WithTimeout(context.Background(), updateCheckTimeout)
+		defer cancel()
+
+		status, err := checker.resolveStatus(statusCtx, version, true)
+		if err != nil {
+			return fmt.Errorf("live check failed: %w", err)
+		}
+
+		if !status.UpdateAvailable {
+			fmt.Fprintln(stdout, formatUpdateCheckMessage(status))
+			return nil
+		}
+		targetVersion = status.LatestVersion
+	}
+
+	if targetVersion == version {
+		fmt.Fprintf(stdout, "%s is up to date\n", version)
+		return nil
+	}
+
+	fmt.Fprintf(stdout, "Updating sympath from %s to %s...\n", version, targetVersion)
+
+	installCtx, installCancel := context.WithTimeout(context.Background(), updateInstallTimeout)
+	defer installCancel()
+
+	result, err := installManagedRelease(installCtx, targetVersion)
+	if err != nil {
+		return err
+	}
+
+	if err := checker.writeCache(updateCache{
+		CheckedAt:     checker.now().UTC(),
+		LatestVersion: result.Version,
+		ReleaseURL:    result.ReleaseURL,
+	}); err != nil && stderr != nil {
+		fmt.Fprintf(stderr, "Warning: failed to update release cache: %v\n", err)
+	}
+
+	if result.Scheduled {
+		fmt.Fprintf(stdout, "Scheduled sympath %s for installation at %s\n", result.Version, result.TargetPath)
+		fmt.Fprintln(stdout, "Restart sympath after this command exits.")
+		return nil
+	}
+
+	fmt.Fprintf(stdout, "Installed sympath %s to %s\n", result.Version, result.TargetPath)
+	return nil
+}
+
+func validateTaggedBuildVersion(currentVersion string) error {
+	if _, err := parseTaggedVersion(currentVersion); err != nil {
+		return fmt.Errorf("sympath update is unavailable for build %s; reinstall with: %s", currentVersion, reinstallCommandForGOOS(runtime.GOOS))
+	}
 	return nil
 }
 
