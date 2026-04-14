@@ -38,7 +38,7 @@ filename with `NewRandomSympathFilename()`. Pass `--verbose` to print startup
 messages about directory creation, remote fetching, consolidation or database
 reuse, and the final database path in use. When stderr is an interactive
 terminal, the CLI also renders a live in-place scan progress line with an
-ASCII spinner, a bouncing track, and running file counts.
+ASCII spinner, a bouncing shaded block track, and running file counts.
 
 The `sympath ui` command follows the same local startup discipline, but with a
 different lifetime model: it takes the startup lock plus the global DB guard

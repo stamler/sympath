@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	inventory "sympath"
 
@@ -19,6 +20,7 @@ const (
 )
 
 var progressSpinnerFrames = []rune{'|', '/', '-', '\\'}
+var progressTrackTailFrames = []rune{'▓', '▒', '░'}
 
 func newScanProgressDisplay(w io.Writer) (*inventory.ScanProgress, *scanProgressDisplay) {
 	if !supportsLiveProgress(w) {
@@ -96,12 +98,13 @@ func (d *scanProgressDisplay) run() {
 
 func (d *scanProgressDisplay) render(frame int, lastWidth *int) {
 	line := formatScanProgressLine(frame, d.progress.Snapshot())
+	lineWidth := utf8.RuneCountInString(line)
 	padding := ""
-	if *lastWidth > len(line) {
-		padding = strings.Repeat(" ", *lastWidth-len(line))
+	if *lastWidth > lineWidth {
+		padding = strings.Repeat(" ", *lastWidth-lineWidth)
 	}
 	fmt.Fprintf(d.w, "\r%s%s", line, padding)
-	*lastWidth = len(line)
+	*lastWidth = lineWidth
 }
 
 func formatScanProgressLine(frame int, snapshot inventory.ScanProgressSnapshot) string {
@@ -126,31 +129,45 @@ func renderProgressTrack(frame, width int) string {
 		return ""
 	}
 
-	sprite := []byte("..:=#=:..")
-	if width <= len(sprite) {
-		return string(sprite[:width])
+	track := make([]rune, width)
+	for i := range track {
+		track[i] = ' '
 	}
 
-	track := strings.Repeat(" ", width)
-	travel := width - len(sprite)
-	pos := bouncePosition(frame, travel)
+	headPos, movingRight := bounceState(frame, width-1)
+	track[headPos] = '█'
 
-	buf := []byte(track)
-	copy(buf[pos:], sprite)
-	return string(buf)
+	for offset, shade := range progressTrackTailFrames {
+		if movingRight {
+			tailPos := headPos - 1 - offset
+			if tailPos < 0 {
+				break
+			}
+			track[tailPos] = shade
+			continue
+		}
+
+		tailPos := headPos + 1 + offset
+		if tailPos >= width {
+			break
+		}
+		track[tailPos] = shade
+	}
+
+	return string(track)
 }
 
-func bouncePosition(frame, travel int) int {
+func bounceState(frame, travel int) (int, bool) {
 	if travel <= 0 {
-		return 0
+		return 0, true
 	}
 
 	cycle := travel * 2
 	step := frame % cycle
 	if step > travel {
-		return cycle - step
+		return cycle - step, false
 	}
-	return step
+	return step, true
 }
 
 func formatCount(n int64) string {

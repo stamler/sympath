@@ -93,7 +93,7 @@ Running `sympath` without a subcommand behaves like `sympath scan`.
 `sympath update` performs the actual managed in-place upgrade for supported per-user installs. `sympath update-check` remains the read-only command for checking release status without changing the installation.
 
 Interactive scans show a live progress line on `stderr` with a spinner,
-an ASCII bouncing track, and running file counts while the inventory is
+a bouncing shaded block track, and running file counts while the inventory is
 being built.
 
 ## Remotes

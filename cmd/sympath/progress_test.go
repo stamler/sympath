@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	inventory "sympath"
 )
@@ -27,16 +28,26 @@ func TestRenderProgressTrackBounces(t *testing.T) {
 	width := 20
 	first := renderProgressTrack(0, width)
 	middle := renderProgressTrack(7, width)
-	returned := renderProgressTrack(22, width)
+	returned := renderProgressTrack((width-1)*2, width)
 
-	if len(first) != width || len(middle) != width || len(returned) != width {
-		t.Fatalf("expected track width %d, got %d/%d/%d", width, len(first), len(middle), len(returned))
+	if utf8.RuneCountInString(first) != width || utf8.RuneCountInString(middle) != width || utf8.RuneCountInString(returned) != width {
+		t.Fatalf("expected track width %d, got %d/%d/%d", width, utf8.RuneCountInString(first), utf8.RuneCountInString(middle), utf8.RuneCountInString(returned))
 	}
 	if first == middle {
 		t.Fatalf("expected track to move, both frames were %q", first)
 	}
 	if first != returned {
 		t.Fatalf("expected bounce cycle to return to start, got %q then %q", first, returned)
+	}
+}
+
+func TestRenderProgressTrackTailFollowsDirection(t *testing.T) {
+	if got := renderProgressTrack(5, 10); got != "  ░▒▓█    " {
+		t.Fatalf("expected rightward tail on the left, got %q", got)
+	}
+
+	if got := renderProgressTrack(13, 10); got != "     █▓▒░ " {
+		t.Fatalf("expected leftward tail on the right, got %q", got)
 	}
 }
 
