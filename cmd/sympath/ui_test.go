@@ -331,7 +331,7 @@ func TestHandleStatusUnavailable(t *testing.T) {
 	}
 }
 
-func TestEmbeddedUIIncludesStatusMountAndFetchPath(t *testing.T) {
+func TestEmbeddedUIIncludesStatusMountAndExplicitCompareAction(t *testing.T) {
 	content, err := fs.ReadFile(uiStaticFS, "ui_static/index.html")
 	if err != nil {
 		t.Fatal(err)
@@ -343,6 +343,15 @@ func TestEmbeddedUIIncludesStatusMountAndFetchPath(t *testing.T) {
 	}
 	if !strings.Contains(html, "fetch('/api/status')") {
 		t.Fatalf("expected status fetch path in embedded UI, got:\n%s", html)
+	}
+	if !strings.Contains(html, "id=\"compare-button\"") {
+		t.Fatalf("expected explicit compare button in embedded UI, got:\n%s", html)
+	}
+	if !strings.Contains(html, "compareButton.addEventListener('click', compare)") {
+		t.Fatalf("expected compare button click handler in embedded UI, got:\n%s", html)
+	}
+	if strings.Contains(html, "setTimeout(compare, 400)") {
+		t.Fatalf("expected compare to be manually triggered, found auto-compare debounce in embedded UI:\n%s", html)
 	}
 	if !strings.Contains(html, ".replace(/'/g, '&#39;')") {
 		t.Fatalf("expected single-quote escaping in attribute helper, got:\n%s", html)

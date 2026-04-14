@@ -78,9 +78,20 @@ td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; font-
 .size { text-align: right; white-space: nowrap; }
 .sha { color: #666; max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
 
-.options { padding: 8px 24px; background: #fff; border-bottom: 1px solid #ddd; display: flex; align-items: center; gap: 8px; }
+.options { padding: 8px 24px; background: #fff; border-bottom: 1px solid #ddd; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .options label { font-size: 13px; color: #444; cursor: pointer; display: flex; align-items: center; gap: 4px; }
 .options input[type="checkbox"] { margin: 0; }
+.compare-controls { margin-left: auto; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.compare-status { font-size: 12px; color: #666; }
+.compare-status.stale,
+.compare-status.busy { color: #8a5b00; }
+.compare-button {
+  border: none; border-radius: 6px; padding: 8px 14px; font-size: 13px; font-weight: 600;
+  background: #1a1a2e; color: #fff; cursor: pointer;
+}
+.compare-button.pending { background: #0b6bcb; }
+.compare-button:disabled { background: #b8bcc8; cursor: not-allowed; }
+.summary.stale { background: #fff7e0; border-bottom-color: #f0d28a; color: #8a5b00; }
 </style>
 </head>
 <body>
@@ -115,6 +126,10 @@ td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; font-
 
 <div class="options">
   <label><input type="checkbox" id="by-content"> Match by content (ignore path)</label>
+  <div class="compare-controls">
+    <span class="compare-status" id="compare-status">Select a root on each side to compare.</span>
+    <button type="button" class="compare-button" id="compare-button" disabled>Compare</button>
+  </div>
 </div>
 
 <div class="summary" id="summary"></div>
@@ -127,12 +142,17 @@ td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; font-
 const leftRootSel = document.getElementById('left-root');
 const rightRootSel = document.getElementById('right-root');
 const byContentBox = document.getElementById('by-content');
+const compareButton = document.getElementById('compare-button');
+const compareStatusEl = document.getElementById('compare-status');
 const summaryEl = document.getElementById('summary');
 const resultsEl = document.getElementById('results');
 const statusEl = document.getElementById('app-status');
 
 let roots = [];
 const dirsCache = {};
+let hasComparisonResult = false;
+let isCompareDirty = false;
+let isComparing = false;
 
 async function init() {
   initStatus();
@@ -149,6 +169,7 @@ async function init() {
   ).join('');
   leftRootSel.innerHTML = placeholder + opts;
   rightRootSel.innerHTML = placeholder + opts;
+  updateCompareActionState();
 }
 
 async function initStatus() {
@@ -178,6 +199,88 @@ function renderStatus(status) {
   }
 
   statusEl.innerHTML = parts.join('');
+}
+
+function normalizePrefix(v) {
+  return v.replace(/\/+$/, '');
+}
+
+function getCompareParams() {
+  const li = leftRootSel.value;
+  const ri = rightRootSel.value;
+  if (li === '' || ri === '') return null;
+
+  const left = roots[parseInt(li)];
+  const right = roots[parseInt(ri)];
+  if (!left || !right) return null;
+
+  const params = new URLSearchParams({
+    left_machine: left.machine_id,
+    left_root: left.root,
+    right_machine: right.machine_id,
+    right_root: right.root,
+  });
+  const lp = normalizePrefix(leftAc.input.value);
+  const rp = normalizePrefix(rightAc.input.value);
+  if (lp) params.set('left_prefix', lp);
+  if (rp) params.set('right_prefix', rp);
+  if (byContentBox.checked) params.set('by_content', '1');
+  return params;
+}
+
+function clearCompareResults(message) {
+  hasComparisonResult = false;
+  summaryEl.style.display = 'none';
+  summaryEl.classList.remove('stale');
+  resultsEl.className = 'results empty';
+  resultsEl.textContent = message;
+}
+
+function updateCompareActionState() {
+  const params = getCompareParams();
+  const ready = params !== null;
+
+  compareButton.disabled = !ready || isComparing;
+  compareButton.textContent = isComparing ? 'Comparing...' : 'Compare';
+  compareButton.classList.toggle('pending', ready && isCompareDirty && !isComparing);
+  compareStatusEl.className = 'compare-status';
+  summaryEl.classList.toggle('stale', isCompareDirty && hasComparisonResult);
+
+  if (isComparing) {
+    compareStatusEl.textContent = isCompareDirty
+      ? 'Selections changed. Compare will re-enable when this run finishes.'
+      : 'Compare running. Some queries can take a while.';
+    compareStatusEl.classList.add('busy');
+    return;
+  }
+  if (!ready) {
+    compareStatusEl.textContent = 'Select a root on each side to compare.';
+    return;
+  }
+  if (isCompareDirty) {
+    compareStatusEl.textContent = hasComparisonResult
+      ? 'Selections changed. Click Compare to refresh the results.'
+      : 'Ready to compare.';
+    compareStatusEl.classList.add('stale');
+    return;
+  }
+  compareStatusEl.textContent = hasComparisonResult
+    ? 'Results are up to date.'
+    : 'Ready to compare.';
+}
+
+function markCompareDirty() {
+  const ready = getCompareParams() !== null;
+  isCompareDirty = ready;
+
+  if (!ready) {
+    clearCompareResults('Select a root on each side to compare.');
+  } else if (!hasComparisonResult && !isComparing) {
+    resultsEl.className = 'results empty';
+    resultsEl.textContent = 'Click Compare to run this query.';
+  }
+
+  updateCompareActionState();
 }
 
 async function fetchDirs(rootIdx) {
@@ -223,7 +326,7 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
         input.placeholder = 'type to filter, Tab to complete';
       }
     }
-    compare();
+    markCompareDirty();
   });
 
   function getMatches(v) {
@@ -306,7 +409,7 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
     input.value = v;
     ghost.textContent = '';
     closeList();
-    scheduleCompare();
+    markCompareDirty();
   }
 
   function updateGhost() {
@@ -329,7 +432,7 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
     activeIdx = -1;
     renderList();
     updateGhost();
-    scheduleCompare();
+    markCompareDirty();
   });
 
   input.addEventListener('keydown', (e) => {
@@ -348,7 +451,7 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
         activeIdx = -1;
         renderList();
         updateGhost();
-        scheduleCompare();
+        markCompareDirty();
       }
     } else if (e.key === 'ArrowDown') {
       e.preventDefault();
@@ -368,7 +471,6 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
         acceptValue(matches[activeIdx] + '/');
       } else {
         closeList();
-        compare();
       }
     } else if (e.key === 'Escape') {
       if (list.classList.contains('open')) {
@@ -378,7 +480,8 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
       } else {
         input.value = '';
         ghost.textContent = '';
-        compare();
+        closeList();
+        markCompareDirty();
       }
     }
   });
@@ -412,56 +515,50 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
 const leftAc = createAutocomplete(leftRootSel, 'left-dir', 'left-ghost', 'left-list');
 const rightAc = createAutocomplete(rightRootSel, 'right-dir', 'right-ghost', 'right-list');
 
-byContentBox.addEventListener('change', compare);
+byContentBox.addEventListener('change', markCompareDirty);
+compareButton.addEventListener('click', compare);
 
 // --- Compare logic ---
 
-let compareTimer = null;
-function scheduleCompare() {
-  clearTimeout(compareTimer);
-  compareTimer = setTimeout(compare, 400);
-}
-
 async function compare() {
-  clearTimeout(compareTimer);
-  const li = leftRootSel.value;
-  const ri = rightRootSel.value;
-  if (li === '' || ri === '') {
-    summaryEl.style.display = 'none';
-    resultsEl.className = 'results empty';
-    resultsEl.textContent = 'Select a root on each side to compare.';
+  const params = getCompareParams();
+  if (!params) {
+    isCompareDirty = false;
+    clearCompareResults('Select a root on each side to compare.');
+    updateCompareActionState();
     return;
   }
 
-  const left = roots[parseInt(li)];
-  const right = roots[parseInt(ri)];
-
+  const requestKey = params.toString();
+  isComparing = true;
+  isCompareDirty = false;
+  hasComparisonResult = false;
+  updateCompareActionState();
   resultsEl.className = 'results empty';
   resultsEl.textContent = 'Comparing...';
   summaryEl.style.display = 'none';
+  summaryEl.classList.remove('stale');
 
   try {
-    const params = new URLSearchParams({
-      left_machine: left.machine_id,
-      left_root: left.root,
-      right_machine: right.machine_id,
-      right_root: right.root,
-    });
-    const lp = leftAc.input.value.replace(/\/+$/, '');
-    const rp = rightAc.input.value.replace(/\/+$/, '');
-    if (lp) params.set('left_prefix', lp);
-    if (rp) params.set('right_prefix', rp);
-    if (byContentBox.checked) params.set('by_content', '1');
-
-    const resp = await fetch('/api/compare?' + params);
+    const resp = await fetch('/api/compare?' + requestKey);
     if (!resp.ok) {
       resultsEl.textContent = 'Error: ' + await resp.text();
       return;
     }
     const data = await resp.json();
+    const currentParams = getCompareParams();
+    if (!currentParams || currentParams.toString() !== requestKey) {
+      isCompareDirty = currentParams !== null;
+      clearCompareResults('Selections changed while compare was running. Click Compare to refresh.');
+      return;
+    }
+    hasComparisonResult = true;
     render(data);
   } catch (e) {
     resultsEl.textContent = 'Request failed: ' + e.message;
+  } finally {
+    isComparing = false;
+    updateCompareActionState();
   }
 }
 
