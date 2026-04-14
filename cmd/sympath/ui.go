@@ -35,6 +35,13 @@ func (localOnlyTransport) FetchRemoteDB(context.Context, string, string, string)
 	return errors.New("remote fetch disabled in ui mode")
 }
 
+// openUIReadOnlyDBForRunUI lets tests observe the precise point where the UI
+// opens the chosen database file. runUIWithIO must keep startupLock and the
+// exclusive DB guard held until this open succeeds so another process cannot
+// reconsolidate ~/.sympath and replace the chosen path in the small gap between
+// selection and open.
+var openUIReadOnlyDBForRunUI = openUIReadOnlyDB
+
 func runUIWithIO(args []string, stdout, stderr io.Writer) error {
 	if len(args) > 0 {
 		return errors.New("ui accepts no arguments")
@@ -44,6 +51,17 @@ func runUIWithIO(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("resolve sympath state directory: %w", err)
 	}
+
+	startupLock, err := acquireScanStartupLock(context.Background(), dir)
+	if err != nil {
+		return fmt.Errorf("acquire scan startup lock: %w", err)
+	}
+	defer startupLock.Close()
+	dbGuard, err := acquireScanDBGuardLockExclusive(context.Background(), dir)
+	if err != nil {
+		return fmt.Errorf("acquire exclusive database guard: %w", err)
+	}
+	defer dbGuard.Close()
 
 	// Suppress warnings from the local-only transport so remote
 	// "skipped" messages don't clutter the UI startup output.
@@ -64,11 +82,30 @@ func runUIWithIO(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	db, err := openUIReadOnlyDB(context.Background(), dbPath)
+	// Open the selected database while startupLock and the exclusive DB guard
+	// are still held. That closes the last startup race: a scan cannot
+	// reconsolidate ~/.sympath and swap out dbPath between "choose this file"
+	// and "open this file".
+	//
+	// Once the read-only connection exists, the UI intentionally releases both
+	// locks and serves that already-open database as a best-effort snapshot.
+	// Later scans are free to reconsolidate and publish newer databases; this UI
+	// process keeps reading the snapshot it selected during startup rather than
+	// pinning the shared DB guard for its entire lifetime.
+	db, err := openUIReadOnlyDBForRunUI(context.Background(), dbPath)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
+
+	if err := dbGuard.Close(); err != nil {
+		return fmt.Errorf("release exclusive database guard: %w", err)
+	}
+	dbGuard = nil
+	if err := startupLock.Close(); err != nil {
+		return fmt.Errorf("release scan startup lock: %w", err)
+	}
+	startupLock = nil
 
 	srv := &uiServer{db: db, updates: newUpdateChecker()}
 	mux := http.NewServeMux()

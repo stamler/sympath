@@ -3,14 +3,21 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	inventory "sympath"
 )
+
+const crashRecoveryHelperEnv = "GO_WANT_CRASH_RECOVERY_HELPER"
 
 func TestRunScan_RejectsDBFlag(t *testing.T) {
 	err := runScanWithIO([]string{"--db", "ignored.sympath"}, io.Discard, io.Discard)
@@ -77,6 +84,450 @@ func TestRunScan_VerboseReportsDatabaseSetup(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "Scan complete") {
 		t.Fatalf("expected scan summary on stdout, got:\n%s", stdout.String())
+	}
+}
+
+func TestRunScan_VerboseReportsInterruptedResumeSource(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(t.TempDir(), "scan-root")
+	t.Setenv("HOME", home)
+
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(root, "file.txt")
+	if err := os.WriteFile(filePath, []byte("content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	startup, err := resolveRunDBPath(context.Background(), fakeRemoteTransport{}, verboseLogger{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", startup.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := inventory.PrepareLocalMachineDB(context.Background(), db, startup.Identity); err != nil {
+		t.Fatal(err)
+	}
+
+	normalizedRoot, err := normalizePath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.Exec(
+		"INSERT INTO scans (machine_id, hostname, root, started_at, status) VALUES (?, ?, ?, ?, 'failed')",
+		startup.Identity.MachineID, startup.Identity.Hostname, normalizedRoot, time.Now().UnixNano(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO entries (scan_id, rel_path, name, ext, size, mtime_ns, fingerprint, sha256, state)
+		VALUES (?, 'file.txt', 'file.txt', '.txt', ?, ?, 'resume-fp', 'resume-sha', 'ok')
+	`, scanID, info.Size(), info.ModTime().UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := runScanWithIO([]string{"--verbose", root}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "Interrupted resume source: scan") {
+		t.Fatalf("expected interrupted resume log, got:\n%s", errOut)
+	}
+	if !strings.Contains(errOut, "(1 reusable entries)") {
+		t.Fatalf("expected reusable entry count in log, got:\n%s", errOut)
+	}
+}
+
+func TestRunScan_VerboseAdoptsStaleRunningScanAsResumeSource(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(t.TempDir(), "scan-root")
+	t.Setenv("HOME", home)
+
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(root, "file.txt")
+	if err := os.WriteFile(filePath, []byte("content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	startup, err := resolveRunDBPath(context.Background(), fakeRemoteTransport{}, verboseLogger{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", startup.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := inventory.PrepareLocalMachineDB(context.Background(), db, startup.Identity); err != nil {
+		t.Fatal(err)
+	}
+
+	normalizedRoot, err := normalizePath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.Exec(
+		"INSERT INTO scans (machine_id, hostname, root, started_at, status) VALUES (?, ?, ?, ?, 'running')",
+		startup.Identity.MachineID, startup.Identity.Hostname, normalizedRoot, time.Now().UnixNano(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO entries (scan_id, rel_path, name, ext, size, mtime_ns, fingerprint, sha256, state)
+		VALUES (?, 'file.txt', 'file.txt', '.txt', ?, ?, 'running-fp', 'running-sha', 'ok')
+	`, scanID, info.Size(), info.ModTime().UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+
+	stateDir, err := sympathStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureSympathDir(stateDir, verboseLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	locksDir, err := ensureScanLocksDir(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath := scanRootLockPath(locksDir, startup.Identity.MachineID, normalizedRoot)
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeScanLockMetadata(lockFile, scanLockMetadata{
+		MachineID: startup.Identity.MachineID,
+		Root:      normalizedRoot,
+	}); err != nil {
+		_ = lockFile.Close()
+		t.Fatal(err)
+	}
+	if err := lockFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := runScanWithIO([]string{"--verbose", root}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "Interrupted resume source: scan") {
+		t.Fatalf("expected stale running scan to be adopted as a resume source, got:\n%s", errOut)
+	}
+	if !strings.Contains(errOut, "(1 reusable entries)") {
+		t.Fatalf("expected reusable entry count in log, got:\n%s", errOut)
+	}
+	if !strings.Contains(stdout.String(), "Scan complete") {
+		t.Fatalf("expected scan summary on stdout, got:\n%s", stdout.String())
+	}
+
+	var state string
+	var fingerprint string
+	var sha256 string
+	if err := db.QueryRow(`
+		SELECT e.state, e.fingerprint, e.sha256
+		FROM entries e
+		JOIN roots r ON r.current_scan_id = e.scan_id
+		WHERE r.machine_id = ? AND r.root = ? AND e.rel_path = 'file.txt'
+	`, startup.Identity.MachineID, normalizedRoot).Scan(&state, &fingerprint, &sha256); err != nil {
+		t.Fatal(err)
+	}
+	if state != "reused" {
+		t.Fatalf("expected reused entry state, got %q", state)
+	}
+	if fingerprint != "running-fp" || sha256 != "running-sha" {
+		t.Fatalf("expected stale running scan hashes to be reused, got (%q, %q)", fingerprint, sha256)
+	}
+}
+
+func TestRunScan_UsesInjectedScanContext(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(t.TempDir(), "scan-root")
+	t.Setenv("HOME", home)
+
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "file.txt"), []byte("content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	prevNewScanContext := newScanContext
+	prevInventoryScan := inventoryScanWithProgress
+	t.Cleanup(func() {
+		newScanContext = prevNewScanContext
+		inventoryScanWithProgress = prevInventoryScan
+		cancel()
+	})
+
+	newScanContext = func() (context.Context, context.CancelFunc) {
+		return ctx, cancel
+	}
+
+	called := false
+	inventoryScanWithProgress = func(scanCtx context.Context, db *sql.DB, root string, progress *inventory.ScanProgress) error {
+		called = true
+		cancel()
+		<-scanCtx.Done()
+		return scanCtx.Err()
+	}
+
+	err := runScanWithIO([]string{root}, io.Discard, io.Discard)
+	if !called {
+		t.Fatal("expected injected scan function to be called")
+	}
+	if err == nil {
+		t.Fatal("expected cancellation error")
+	}
+	if !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("expected context cancellation error, got %v", err)
+	}
+}
+
+func TestRunScan_AllowsConcurrentDisjointRootWhileAnotherScanIsActive(t *testing.T) {
+	home := t.TempDir()
+	rootA := filepath.Join(t.TempDir(), "root-a")
+	rootB := filepath.Join(t.TempDir(), "root-b")
+	t.Setenv("HOME", home)
+
+	if err := os.MkdirAll(rootA, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(rootB, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootA, "a.txt"), []byte("alpha"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootB, "b.txt"), []byte("beta"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	startup := seedRunDBForScanTests(t)
+	stateDir, err := sympathStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalizedRootA, err := normalizePath(rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalizedRootB, err := normalizePath(rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	helperCmd, helperStdin := startActiveScanHelper(t, stateDir, startup.Identity.MachineID, normalizedRootA)
+	defer func() {
+		_ = helperStdin.Close()
+		_ = helperCmd.Wait()
+	}()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := runScanWithIO([]string{"--verbose", rootB}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "Using existing database while another scan is active: "+startup.DBPath) {
+		t.Fatalf("expected concurrent disjoint scan to reuse active database, got:\n%s", errOut)
+	}
+	if !strings.Contains(stdout.String(), "Scan complete") {
+		t.Fatalf("expected scan summary on stdout, got:\n%s", stdout.String())
+	}
+
+	db, err := sql.Open("sqlite", startup.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var rootCount int
+	if err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM roots
+		WHERE machine_id = ? AND root = ?
+	`, startup.Identity.MachineID, normalizedRootB).Scan(&rootCount); err != nil {
+		t.Fatal(err)
+	}
+	if rootCount != 1 {
+		t.Fatalf("expected disjoint concurrent scan to publish one root row, got %d", rootCount)
+	}
+
+	localDBs, err := listSympathDBs(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(localDBs) != 1 || localDBs[0] != startup.DBPath {
+		t.Fatalf("expected active scan to preserve the existing database path %q, got %v", startup.DBPath, localDBs)
+	}
+}
+
+func TestRunScan_RejectsConcurrentOverlappingRootAtCLILevel(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(t.TempDir(), "root")
+	overlapRoot := filepath.Join(root, "nested")
+	t.Setenv("HOME", home)
+
+	if err := os.MkdirAll(overlapRoot, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("alpha"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(overlapRoot, "b.txt"), []byte("beta"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	startup := seedRunDBForScanTests(t)
+	stateDir, err := sympathStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalizedRoot, err := normalizePath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalizedOverlapRoot, err := normalizePath(overlapRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	helperCmd, helperStdin := startActiveScanHelper(t, stateDir, startup.Identity.MachineID, normalizedRoot)
+	defer func() {
+		_ = helperStdin.Close()
+		_ = helperCmd.Wait()
+	}()
+
+	err = runScanWithIO([]string{overlapRoot}, io.Discard, io.Discard)
+	if err == nil {
+		t.Fatal("expected overlapping root scan to be rejected")
+	}
+	if !strings.Contains(err.Error(), "overlapping root") {
+		t.Fatalf("expected overlapping-root error, got %v", err)
+	}
+
+	db, err := sql.Open("sqlite", startup.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var scanCount int
+	if err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM scans
+		WHERE machine_id = ? AND root = ?
+	`, startup.Identity.MachineID, normalizedOverlapRoot).Scan(&scanCount); err != nil {
+		t.Fatal(err)
+	}
+	if scanCount != 0 {
+		t.Fatalf("expected overlapping root rejection before scan creation, got %d scan rows", scanCount)
+	}
+}
+
+func TestRunScan_HardKillRecoveryReusesOrphanedRunningScan(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(t.TempDir(), "scan-root")
+	t.Setenv("HOME", home)
+
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "file.txt"), []byte("content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	startup := seedRunDBForScanTests(t)
+	normalizedRoot, err := normalizePath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	helperCmd, helperStdin := startCrashRecoveryHelper(t, root)
+	defer func() {
+		_ = helperStdin.Close()
+		_ = helperCmd.Wait()
+	}()
+
+	if err := helperCmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := helperCmd.Wait(); err == nil {
+		t.Fatal("expected helper to exit via hard kill")
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := runScanWithIO([]string{"--verbose", root}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "Interrupted resume source: scan") {
+		t.Fatalf("expected orphaned running scan to be resumed, got:\n%s", errOut)
+	}
+	if !strings.Contains(stdout.String(), "Scan complete") {
+		t.Fatalf("expected scan summary on stdout, got:\n%s", stdout.String())
+	}
+
+	db, err := sql.Open("sqlite", startup.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var state string
+	var fingerprint string
+	var sha256 string
+	if err := db.QueryRow(`
+		SELECT e.state, e.fingerprint, e.sha256
+		FROM entries e
+		JOIN roots r ON r.current_scan_id = e.scan_id
+		WHERE r.machine_id = ? AND r.root = ? AND e.rel_path = 'file.txt'
+	`, startup.Identity.MachineID, normalizedRoot).Scan(&state, &fingerprint, &sha256); err != nil {
+		t.Fatal(err)
+	}
+	if state != "reused" {
+		t.Fatalf("expected reused entry state after hard-kill recovery, got %q", state)
+	}
+	if fingerprint != "crash-fp" || sha256 != "crash-sha" {
+		t.Fatalf("expected hard-killed scan hashes to be reused, got (%q, %q)", fingerprint, sha256)
 	}
 }
 
@@ -499,4 +950,161 @@ func writeUpdateCacheForTest(t *testing.T, stateDir string, cache updateCache) {
 	if err := checker.writeCache(cache); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func seedRunDBForScanTests(t *testing.T) startupState {
+	t.Helper()
+
+	startup, err := resolveRunDBPath(context.Background(), fakeRemoteTransport{}, verboseLogger{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", startup.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := inventory.PrepareLocalMachineDB(context.Background(), db, startup.Identity); err != nil {
+		t.Fatal(err)
+	}
+
+	return startup
+}
+
+func TestCrashRecoveryHelperProcess(t *testing.T) {
+	if os.Getenv(crashRecoveryHelperEnv) != "1" {
+		return
+	}
+
+	root := os.Getenv("CRASH_HELPER_ROOT")
+
+	stateDir, err := sympathStateDir()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	startupLock, err := acquireScanStartupLock(context.Background(), stateDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(3)
+	}
+	exclusiveDBGuard, err := acquireScanDBGuardLockExclusive(context.Background(), stateDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(4)
+	}
+	startup, err := resolveRunDBPath(context.Background(), fakeRemoteTransport{}, verboseLogger{})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(5)
+	}
+	normalizedRoot, err := normalizePath(root)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(6)
+	}
+	rootLock, err := acquireScanRootLock(stateDir, startup.Identity.MachineID, normalizedRoot)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(7)
+	}
+
+	db, err := sql.Open("sqlite", startup.DBPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(8)
+	}
+	if err := inventory.PrepareLocalMachineDB(context.Background(), db, startup.Identity); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(9)
+	}
+	if err := exclusiveDBGuard.Close(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(10)
+	}
+	dbGuard, err := acquireScanDBGuardLockShared(context.Background(), stateDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(11)
+	}
+	if err := startupLock.Close(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(12)
+	}
+
+	info, err := os.Stat(filepath.Join(root, "file.txt"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(13)
+	}
+
+	result, err := db.Exec(
+		"INSERT INTO scans (machine_id, hostname, root, started_at, status) VALUES (?, ?, ?, ?, 'running')",
+		startup.Identity.MachineID, startup.Identity.Hostname, normalizedRoot, time.Now().UnixNano(),
+	)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(14)
+	}
+	scanID, err := result.LastInsertId()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(15)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO entries (scan_id, rel_path, name, ext, size, mtime_ns, fingerprint, sha256, state)
+		VALUES (?, 'file.txt', 'file.txt', '.txt', ?, ?, 'crash-fp', 'crash-sha', 'ok')
+	`, scanID, info.Size(), info.ModTime().UnixNano()); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(16)
+	}
+
+	fmt.Fprintln(os.Stdout, "ready")
+	_ = os.Stdout.Sync()
+	_, _ = io.ReadAll(os.Stdin)
+	_ = db.Close()
+	_ = dbGuard.Close()
+	_ = rootLock.Close()
+	os.Exit(0)
+}
+
+func startCrashRecoveryHelper(t *testing.T, root string) (*exec.Cmd, io.WriteCloser) {
+	t.Helper()
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestCrashRecoveryHelperProcess")
+	cmd.Env = append(os.Environ(),
+		crashRecoveryHelperEnv+"=1",
+		"CRASH_HELPER_ROOT="+root,
+	)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	lineBuf := make([]byte, 6)
+	if _, err := io.ReadFull(stdout, lineBuf); err != nil {
+		_ = stdin.Close()
+		_ = cmd.Wait()
+		t.Fatalf("wait for crash helper readiness: %v (stderr: %s)", err, stderr.String())
+	}
+	if string(lineBuf) != "ready\n" {
+		_ = stdin.Close()
+		_ = cmd.Wait()
+		t.Fatalf("unexpected crash helper output %q (stderr: %s)", string(lineBuf), stderr.String())
+	}
+
+	return cmd, stdin
 }

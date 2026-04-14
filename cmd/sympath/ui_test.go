@@ -4,10 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
@@ -193,6 +197,87 @@ func TestRunUIWithIONoInventoryDB(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "run `sympath scan [ROOT]` first") {
 		t.Fatalf("expected friendly scan-first error, got %v", err)
+	}
+}
+
+func TestRunUIWithIO_WaitsForActiveScanToReleaseDBGuard(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	stateDir, err := sympathStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeRoot := filepath.Clean(filepath.Join(string(filepath.Separator), "active", "root"))
+	helperCmd, helperStdin := startActiveScanHelper(t, stateDir, "machine-a", activeRoot)
+	defer func() {
+		_ = helperStdin.Close()
+		_ = helperCmd.Wait()
+	}()
+
+	resultCh := make(chan error, 1)
+	go func() {
+		resultCh <- runUIWithIO(nil, io.Discard, io.Discard)
+	}()
+
+	select {
+	case err := <-resultCh:
+		t.Fatalf("expected UI startup to wait for active scan, returned early with %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	if err := helperStdin.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := helperCmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-resultCh:
+		if err == nil {
+			t.Fatal("expected missing-inventory error after active scan released")
+		}
+		if !strings.Contains(err.Error(), "run `sympath scan [ROOT]` first") {
+			t.Fatalf("expected friendly scan-first error after release, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected UI startup to finish after active scan released")
+	}
+}
+
+func TestRunUIWithIO_OpensDatabaseBeforeReleasingStartupProtection(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	startup := seedRunDBForScanTests(t)
+	stateDir, err := sympathStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sentinel := errors.New("stop after verified UI open")
+	prevOpen := openUIReadOnlyDBForRunUI
+	openUIReadOnlyDBForRunUI = func(ctx context.Context, dbPath string) (*sql.DB, error) {
+		t.Helper()
+
+		if dbPath != startup.DBPath {
+			t.Fatalf("expected UI to open %q, got %q", startup.DBPath, dbPath)
+		}
+		state, err := probeSharedDBGuardDuringUIOpen(stateDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state != "blocked" {
+			t.Fatalf("expected DB guard probe to block during UI open, got %q", state)
+		}
+		return nil, sentinel
+	}
+	t.Cleanup(func() { openUIReadOnlyDBForRunUI = prevOpen })
+
+	err = runUIWithIO(nil, io.Discard, io.Discard)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected sentinel error after probe, got %v", err)
 	}
 }
 
@@ -703,4 +788,18 @@ func TestHandleCompareByContentWithPrefix(t *testing.T) {
 	if len(result.LeftOnly) != 1 {
 		t.Fatalf("expected 1 left-only by content with prefix, got %d: %v", len(result.LeftOnly), result.LeftOnly)
 	}
+}
+
+func probeSharedDBGuardDuringUIOpen(stateDir string) (string, error) {
+	cmd := exec.Command(os.Args[0], "-test.run=TestScanLockHelperProcess")
+	cmd.Env = append(os.Environ(),
+		scanLockHelperEnv+"=1",
+		"SCAN_LOCK_STATE_DIR="+stateDir,
+		scanLockHelperModeEnv+"=probe-shared-db-guard-blocked",
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("probe shared db guard: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	return strings.TrimSpace(string(output)), nil
 }

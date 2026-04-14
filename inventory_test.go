@@ -3,6 +3,7 @@ package inventory
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,6 +105,65 @@ func updateEntryResult(t *testing.T, db *sql.DB, scanID int64, relPath, state, f
 	}
 }
 
+func getEntryHashes(t *testing.T, db *sql.DB, root, relPath string) (string, string) {
+	t.Helper()
+	var fingerprint, sha256 sql.NullString
+	err := db.QueryRow(`
+		SELECT e.fingerprint, e.sha256 FROM entries e
+		JOIN roots r ON r.current_scan_id = e.scan_id
+		WHERE r.root = ? AND e.rel_path = ?`, root, relPath,
+	).Scan(&fingerprint, &sha256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fingerprint.String, sha256.String
+}
+
+func insertManualScan(t *testing.T, db *sql.DB, machineID, hostname, root, status string) int64 {
+	t.Helper()
+	result, err := db.Exec(
+		"INSERT INTO scans (machine_id, hostname, root, started_at, status) VALUES (?, ?, ?, ?, ?)",
+		machineID, hostname, root, time.Now().UnixNano(), status,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return scanID
+}
+
+func insertManualEntry(t *testing.T, db *sql.DB, scanID int64, relPath string, size, mtimeNS int64, state, fingerprint, sha256 string) {
+	t.Helper()
+	name := filepath.Base(relPath)
+	ext := strings.ToLower(filepath.Ext(name))
+	var fingerprintValue any
+	if fingerprint != "" {
+		fingerprintValue = fingerprint
+	}
+	var shaValue any
+	if sha256 != "" {
+		shaValue = sha256
+	}
+	if _, err := db.Exec(`
+		INSERT INTO entries (scan_id, rel_path, name, ext, size, mtime_ns, fingerprint, sha256, state)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, scanID, relPath, name, ext, size, mtimeNS, fingerprintValue, shaValue, state); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func fileSizeAndMtime(t *testing.T, path string) (int64, int64) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Size(), info.ModTime().UnixNano()
+}
+
 func TestReuseSources_DoesNotLoadOverlapWhenExactMatches(t *testing.T) {
 	called := false
 	expected := PrevEntry{
@@ -113,7 +173,7 @@ func TestReuseSources_DoesNotLoadOverlapWhenExactMatches(t *testing.T) {
 		SHA256:      "sha",
 	}
 	reuse := &reuseSources{
-		exact: map[string]PrevEntry{"file.txt": expected},
+		exact: map[string][]PrevEntry{"file.txt": {expected}},
 		loadOverlap: func() (overlapReuseIndex, error) {
 			called = true
 			return overlapReuseIndex{
@@ -146,7 +206,7 @@ func TestReuseSources_LoadsOverlapOnExactMiss(t *testing.T) {
 		SHA256:      "sha",
 	}
 	reuse := &reuseSources{
-		exact: map[string]PrevEntry{},
+		exact: map[string][]PrevEntry{},
 		loadOverlap: func() (overlapReuseIndex, error) {
 			calls++
 			return overlapReuseIndex{
@@ -178,6 +238,25 @@ func TestReuseSources_LoadsOverlapOnExactMiss(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("expected overlap loader to run once, got %d", calls)
+	}
+}
+
+func TestReuseSources_ConflictingExactMatchesMiss(t *testing.T) {
+	reuse := &reuseSources{
+		exact: map[string][]PrevEntry{
+			"file.txt": {
+				{Size: 5, MtimeNS: 7, Fingerprint: "fp-a", SHA256: "sha-a"},
+				{Size: 5, MtimeNS: 7, Fingerprint: "fp-b", SHA256: "sha-b"},
+			},
+		},
+	}
+
+	prev, ok, err := reuse.lookup("file.txt", 5, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatalf("expected conflicting exact candidates to miss, got %+v", prev)
 	}
 }
 
@@ -753,6 +832,251 @@ func TestInventoryTree_OrphanedScanCleanup(t *testing.T) {
 	}
 	if status != "complete" {
 		t.Errorf("expected scan status complete, got %s", status)
+	}
+}
+
+func TestInventoryTree_ResumesInterruptedScanEntries(t *testing.T) {
+	dir := t.TempDir()
+	scanDir := filepath.Join(dir, "data")
+	os.MkdirAll(scanDir, 0755)
+
+	createTestTree(t, scanDir, map[string]string{
+		"resume-ok.txt":     "resume from ok",
+		"resume-reused.txt": "resume from reused",
+		"skip-pending.txt":  "must hash again",
+		"skip-error.txt":    "must hash again too",
+	})
+
+	db := openTestDB(t, dir)
+	ctx := context.Background()
+	absRoot, _ := resolveAbsPath(scanDir)
+	identity := MachineIdentity{MachineID: "resume-machine", Hostname: "resume-host"}
+	if err := PrepareLocalMachineDB(ctx, db, identity); err != nil {
+		t.Fatal(err)
+	}
+
+	interruptedScanID := insertManualScan(t, db, identity.MachineID, identity.Hostname, absRoot, "failed")
+	for _, tc := range []struct {
+		relPath     string
+		state       string
+		fingerprint string
+		sha256      string
+	}{
+		{relPath: "resume-ok.txt", state: "ok", fingerprint: "resume-ok-fp", sha256: "resume-ok-sha"},
+		{relPath: "resume-reused.txt", state: "reused", fingerprint: "resume-reused-fp", sha256: "resume-reused-sha"},
+		{relPath: "skip-pending.txt", state: "pending", fingerprint: "pending-fp", sha256: "pending-sha"},
+		{relPath: "skip-error.txt", state: "error", fingerprint: "error-fp", sha256: "error-sha"},
+	} {
+		size, mtimeNS := fileSizeAndMtime(t, filepath.Join(scanDir, tc.relPath))
+		insertManualEntry(t, db, interruptedScanID, tc.relPath, size, mtimeNS, tc.state, tc.fingerprint, tc.sha256)
+	}
+
+	if err := InventoryTree(ctx, db, scanDir); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		relPath     string
+		fingerprint string
+		sha256      string
+	}{
+		{relPath: "resume-ok.txt", fingerprint: "resume-ok-fp", sha256: "resume-ok-sha"},
+		{relPath: "resume-reused.txt", fingerprint: "resume-reused-fp", sha256: "resume-reused-sha"},
+	} {
+		if state := getEntryState(t, db, absRoot, tc.relPath); state != "reused" {
+			t.Fatalf("%s: expected reused, got %s", tc.relPath, state)
+		}
+		fingerprint, sha256 := getEntryHashes(t, db, absRoot, tc.relPath)
+		if fingerprint != tc.fingerprint || sha256 != tc.sha256 {
+			t.Fatalf("%s: expected (%s, %s), got (%s, %s)", tc.relPath, tc.fingerprint, tc.sha256, fingerprint, sha256)
+		}
+	}
+
+	for _, relPath := range []string{"skip-pending.txt", "skip-error.txt"} {
+		if state := getEntryState(t, db, absRoot, relPath); state != "ok" {
+			t.Fatalf("%s: expected ok after re-hash, got %s", relPath, state)
+		}
+	}
+
+	if scanCount := countScans(t, db, absRoot); scanCount != 1 {
+		t.Fatalf("expected interrupted scan cleanup to leave 1 scan, got %d", scanCount)
+	}
+}
+
+func TestInventoryTree_DoesNotResumeRunningScanEntries(t *testing.T) {
+	dir := t.TempDir()
+	scanDir := filepath.Join(dir, "data")
+	os.MkdirAll(scanDir, 0755)
+
+	createTestTree(t, scanDir, map[string]string{
+		"file.txt": "live running scan should not be reused",
+	})
+
+	db := openTestDB(t, dir)
+	ctx := context.Background()
+	absRoot, _ := resolveAbsPath(scanDir)
+	identity := MachineIdentity{MachineID: "resume-machine", Hostname: "resume-host"}
+	if err := PrepareLocalMachineDB(ctx, db, identity); err != nil {
+		t.Fatal(err)
+	}
+
+	runningScanID := insertManualScan(t, db, identity.MachineID, identity.Hostname, absRoot, "running")
+	size, mtimeNS := fileSizeAndMtime(t, filepath.Join(scanDir, "file.txt"))
+	insertManualEntry(t, db, runningScanID, "file.txt", size, mtimeNS, "ok", "running-fp", "running-sha")
+
+	if err := InventoryTree(ctx, db, scanDir); err != nil {
+		t.Fatal(err)
+	}
+
+	if state := getEntryState(t, db, absRoot, "file.txt"); state != "ok" {
+		t.Fatalf("file.txt: expected fresh hash instead of running-scan reuse, got %s", state)
+	}
+	fingerprint, sha256 := getEntryHashes(t, db, absRoot, "file.txt")
+	if fingerprint == "running-fp" || sha256 == "running-sha" {
+		t.Fatalf("file.txt: unexpectedly reused running scan hashes (%s, %s)", fingerprint, sha256)
+	}
+}
+
+func TestInventoryTree_InterruptedScanFallsBackToAuthoritativeHashes(t *testing.T) {
+	dir := t.TempDir()
+	scanDir := filepath.Join(dir, "data")
+	os.MkdirAll(scanDir, 0755)
+
+	createTestTree(t, scanDir, map[string]string{
+		"from-interrupted.txt":   "before change",
+		"from-authoritative.txt": "still stable",
+	})
+
+	db := openTestDB(t, dir)
+	ctx := context.Background()
+	absRoot, _ := resolveAbsPath(scanDir)
+	identity := MachineIdentity{MachineID: "resume-machine", Hostname: "resume-host"}
+	if err := PrepareLocalMachineDB(ctx, db, identity); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := InventoryTree(ctx, db, scanDir); err != nil {
+		t.Fatal(err)
+	}
+	authoritativeFingerprint, authoritativeSHA := getEntryHashes(t, db, absRoot, "from-authoritative.txt")
+
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(scanDir, "from-interrupted.txt"), []byte("after change for interrupted reuse"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	interruptedSize, interruptedMtimeNS := fileSizeAndMtime(t, filepath.Join(scanDir, "from-interrupted.txt"))
+	authoritativeSize, authoritativeMtimeNS := fileSizeAndMtime(t, filepath.Join(scanDir, "from-authoritative.txt"))
+
+	interruptedScanID := insertManualScan(t, db, identity.MachineID, identity.Hostname, absRoot, "failed")
+	insertManualEntry(t, db, interruptedScanID, "from-interrupted.txt", interruptedSize, interruptedMtimeNS, "ok", "resume-fp", "resume-sha")
+	insertManualEntry(t, db, interruptedScanID, "from-authoritative.txt", authoritativeSize+1, authoritativeMtimeNS+1, "ok", "stale-fp", "stale-sha")
+
+	if err := InventoryTree(ctx, db, scanDir); err != nil {
+		t.Fatal(err)
+	}
+
+	if state := getEntryState(t, db, absRoot, "from-interrupted.txt"); state != "reused" {
+		t.Fatalf("from-interrupted.txt: expected reused, got %s", state)
+	}
+	fingerprint, sha256 := getEntryHashes(t, db, absRoot, "from-interrupted.txt")
+	if fingerprint != "resume-fp" || sha256 != "resume-sha" {
+		t.Fatalf("from-interrupted.txt: expected interrupted hashes, got (%s, %s)", fingerprint, sha256)
+	}
+
+	if state := getEntryState(t, db, absRoot, "from-authoritative.txt"); state != "reused" {
+		t.Fatalf("from-authoritative.txt: expected reused, got %s", state)
+	}
+	fingerprint, sha256 = getEntryHashes(t, db, absRoot, "from-authoritative.txt")
+	if fingerprint != authoritativeFingerprint || sha256 != authoritativeSHA {
+		t.Fatalf("from-authoritative.txt: expected authoritative hashes (%s, %s), got (%s, %s)", authoritativeFingerprint, authoritativeSHA, fingerprint, sha256)
+	}
+	if fingerprint == "stale-fp" || sha256 == "stale-sha" {
+		t.Fatal("from-authoritative.txt: unexpectedly reused stale interrupted hashes")
+	}
+
+	if scanCount := countScans(t, db, absRoot); scanCount != 1 {
+		t.Fatalf("expected successful publish to keep one complete scan, got %d", scanCount)
+	}
+}
+
+func TestInventoryTree_ConflictingExactReuseCandidatesTriggerFreshHash(t *testing.T) {
+	dir := t.TempDir()
+	scanDir := filepath.Join(dir, "data")
+	os.MkdirAll(scanDir, 0755)
+
+	createTestTree(t, scanDir, map[string]string{
+		"file.txt": "authoritative content",
+	})
+
+	db := openTestDB(t, dir)
+	ctx := context.Background()
+	absRoot, _ := resolveAbsPath(scanDir)
+	identity := MachineIdentity{MachineID: "resume-machine", Hostname: "resume-host"}
+	if err := PrepareLocalMachineDB(ctx, db, identity); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := InventoryTree(ctx, db, scanDir); err != nil {
+		t.Fatal(err)
+	}
+	authoritativeScanID := currentScanID(t, db, absRoot)
+	updateEntryHashes(t, db, authoritativeScanID, "file.txt", "authoritative-fp", "authoritative-sha")
+
+	size, mtimeNS := fileSizeAndMtime(t, filepath.Join(scanDir, "file.txt"))
+	interruptedScanID := insertManualScan(t, db, identity.MachineID, identity.Hostname, absRoot, "failed")
+	insertManualEntry(t, db, interruptedScanID, "file.txt", size, mtimeNS, "ok", "interrupted-fp", "interrupted-sha")
+
+	if err := InventoryTree(ctx, db, scanDir); err != nil {
+		t.Fatal(err)
+	}
+
+	if state := getEntryState(t, db, absRoot, "file.txt"); state != "ok" {
+		t.Fatalf("file.txt: expected fresh hash after conflicting exact candidates, got %s", state)
+	}
+	fingerprint, sha256 := getEntryHashes(t, db, absRoot, "file.txt")
+	if fingerprint == "authoritative-fp" || sha256 == "authoritative-sha" || fingerprint == "interrupted-fp" || sha256 == "interrupted-sha" {
+		t.Fatalf("file.txt: unexpectedly reused conflicting exact hashes (%s, %s)", fingerprint, sha256)
+	}
+}
+
+func TestInventoryTree_CancellationMarksScanFailed(t *testing.T) {
+	dir := t.TempDir()
+	scanDir := filepath.Join(dir, "data")
+	os.MkdirAll(scanDir, 0755)
+
+	createTestTree(t, scanDir, map[string]string{
+		"file.txt": "content",
+	})
+
+	db := openTestDB(t, dir)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	prevHook := afterCreateScanHook
+	afterCreateScanHook = func(int64) {
+		cancel()
+	}
+	t.Cleanup(func() {
+		afterCreateScanHook = prevHook
+	})
+
+	absRoot, _ := resolveAbsPath(scanDir)
+	err := InventoryTree(ctx, db, scanDir)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation, got %v", err)
+	}
+
+	var status string
+	var finishedAt sql.NullInt64
+	err = db.QueryRow("SELECT status, finished_at FROM scans WHERE root = ? ORDER BY scan_id DESC LIMIT 1", absRoot).Scan(&status, &finishedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" {
+		t.Fatalf("expected failed scan after cancellation, got %s", status)
+	}
+	if !finishedAt.Valid {
+		t.Fatal("expected failed scan to record finished_at")
 	}
 }
 

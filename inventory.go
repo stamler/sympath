@@ -12,8 +12,9 @@ package inventory
 // Orchestration proceeds in these phases:
 //
 //  1. Setup: resolve root path, configure DB connection, ensure schema,
-//     detect DB file for exclusion, load exact-root reuse data, detect
-//     volume info (filesystem type and case sensitivity).
+//     detect DB file for exclusion, load exact-root reuse data from the
+//     authoritative and newest failed interrupted scans, detect volume
+//     info (filesystem type and case sensitivity).
 //  2. Pipeline: launch walker, N hash workers, and writer goroutines
 //     connected by buffered channels.
 //  3. Coordination: walker closes entryCh + jobCh → workers drain and
@@ -31,6 +32,12 @@ import (
 	"time"
 )
 
+const failScanTimeout = 5 * time.Second
+
+// afterCreateScanHook lets package tests synchronize cancellation after the
+// scan row exists but before the pipeline does substantial work.
+var afterCreateScanHook func(int64)
+
 // InventoryTree scans the directory tree rooted at root and populates the
 // SQLite database db with file metadata and content hashes for every
 // regular file found.
@@ -41,10 +48,10 @@ import (
 // leaves the previous scan intact.
 //
 // Subsequent calls reuse fingerprints and SHA-256 hashes from the
-// previous scan for the same root and, on exact misses, can fall back to
-// overlapping authoritative scans on the same machine when a file's
-// (size, mtime_ns) are unchanged, making re-scans of mostly-static
-// trees very fast.
+// authoritative and newest failed interrupted scans for the same root
+// and, on exact misses, can fall back to overlapping authoritative scans
+// on the same machine when a file's (size, mtime_ns) are unchanged,
+// making re-scans of mostly-static trees very fast.
 //
 // The pipeline uses min(NumCPU, 4) hash workers to avoid disk thrashing
 // while still saturating SHA-256 throughput on fast storage.
@@ -78,11 +85,7 @@ func InventoryTreeWithProgress(ctx context.Context, db *sql.DB, root string, pro
 	excludeSet := makeExcludeSet(dbPath)
 
 	// Load reuse sources for exact-root and overlapping-root reuse.
-	prevScanID, err := getCurrentScanID(ctx, db, identity.MachineID, absRoot)
-	if err != nil {
-		return err
-	}
-	prevEntries, err := loadPreviousEntries(ctx, db, prevScanID)
+	prevEntries, err := loadExactReuseEntries(ctx, db, identity.MachineID, absRoot)
 	if err != nil {
 		return err
 	}
@@ -100,6 +103,9 @@ func InventoryTreeWithProgress(ctx context.Context, db *sql.DB, root string, pro
 	scanID, err := createScan(ctx, db, identity, absRoot, volInfo)
 	if err != nil {
 		return err
+	}
+	if afterCreateScanHook != nil {
+		afterCreateScanHook(scanID)
 	}
 
 	// Determine worker count
@@ -149,7 +155,9 @@ func InventoryTreeWithProgress(ctx context.Context, db *sql.DB, root string, pro
 
 	// Determine outcome
 	if walkerErr != nil || writerErr != nil {
-		_ = failScan(ctx, db, scanID)
+		failCtx, cancel := context.WithTimeout(context.Background(), failScanTimeout)
+		_ = failScan(failCtx, db, scanID)
+		cancel()
 		if walkerErr != nil {
 			return walkerErr
 		}
@@ -180,16 +188,82 @@ func getCurrentScanID(ctx context.Context, db *sql.DB, machineID, root string) (
 	return scanID.Int64, nil
 }
 
-// loadPreviousEntries preloads all entries from the previous scan into a
-// map keyed by rel_path. The walker uses this map for O(1) reuse lookups.
-// If scanID is 0 (no previous scan), an empty map is returned.
-func loadPreviousEntries(ctx context.Context, db *sql.DB, scanID int64) (map[string]PrevEntry, error) {
+// getLatestInterruptedScanID returns the newest failed interrupted scan
+// for a machine/root pair. Failed scans remain non-authoritative but can
+// provide reusable hashes for a follow-up scan without exposing
+// in-progress rows from a concurrently running scan.
+func getLatestInterruptedScanID(ctx context.Context, db *sql.DB, machineID, root string) (int64, error) {
+	var scanID sql.NullInt64
+	err := db.QueryRowContext(ctx, `
+		SELECT scan_id
+		FROM scans
+		WHERE machine_id = ? AND root = ? AND status = 'failed'
+		ORDER BY scan_id DESC
+		LIMIT 1
+	`, machineID, root).Scan(&scanID)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !scanID.Valid {
+		return 0, nil
+	}
+	return scanID.Int64, nil
+}
+
+// loadExactReuseEntries preloads exact-root reusable entries from both the
+// authoritative current scan and the newest failed interrupted scan for
+// the same machine/root pair. The walker checks each candidate's size
+// and mtime before reusing stored hashes.
+func loadExactReuseEntries(ctx context.Context, db *sql.DB, machineID, root string) (map[string][]PrevEntry, error) {
+	prevScanID, err := getCurrentScanID(ctx, db, machineID, root)
+	if err != nil {
+		return nil, err
+	}
+	interruptedScanID, err := getLatestInterruptedScanID(ctx, db, machineID, root)
+	if err != nil {
+		return nil, err
+	}
+
+	entries := make(map[string][]PrevEntry)
+	if interruptedScanID != 0 {
+		interruptedEntries, err := loadPreviousEntries(ctx, db, interruptedScanID, map[string]struct{}{
+			"ok":     {},
+			"reused": {},
+		})
+		if err != nil {
+			return nil, err
+		}
+		mergePreviousEntries(entries, interruptedEntries)
+	}
+
+	authoritativeEntries, err := loadPreviousEntries(ctx, db, prevScanID, nil)
+	if err != nil {
+		return nil, err
+	}
+	mergePreviousEntries(entries, authoritativeEntries)
+	return entries, nil
+}
+
+func mergePreviousEntries(dst map[string][]PrevEntry, src map[string]PrevEntry) {
+	for relPath, entry := range src {
+		dst[relPath] = append(dst[relPath], entry)
+	}
+}
+
+// loadPreviousEntries preloads reusable entries from a scan into a map
+// keyed by rel_path. If allowedStates is non-nil, only rows with a state
+// present in that set are loaded. If scanID is 0, an empty map is
+// returned.
+func loadPreviousEntries(ctx context.Context, db *sql.DB, scanID int64, allowedStates map[string]struct{}) (map[string]PrevEntry, error) {
 	if scanID == 0 {
 		return make(map[string]PrevEntry), nil
 	}
 
 	rows, err := db.QueryContext(ctx,
-		"SELECT rel_path, size, mtime_ns, fingerprint, sha256 FROM entries WHERE scan_id = ?",
+		"SELECT rel_path, size, mtime_ns, fingerprint, sha256, state FROM entries WHERE scan_id = ?",
 		scanID,
 	)
 	if err != nil {
@@ -199,9 +273,25 @@ func loadPreviousEntries(ctx context.Context, db *sql.DB, scanID int64) (map[str
 
 	entries := make(map[string]PrevEntry)
 	for rows.Next() {
-		relPath, pe, err := scanPrevEntry(rows)
-		if err != nil {
+		var relPath string
+		var pe PrevEntry
+		var fp, hash, state sql.NullString
+		if err := rows.Scan(&relPath, &pe.Size, &pe.MtimeNS, &fp, &hash, &state); err != nil {
 			return nil, err
+		}
+		if allowedStates != nil {
+			if !state.Valid {
+				continue
+			}
+			if _, ok := allowedStates[state.String]; !ok {
+				continue
+			}
+		}
+		if fp.Valid {
+			pe.Fingerprint = fp.String
+		}
+		if hash.Valid {
+			pe.SHA256 = hash.String
 		}
 		entries[relPath] = pe
 	}

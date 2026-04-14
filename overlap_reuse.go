@@ -1,3 +1,32 @@
+// Package inventory contains the scan-time reuse logic that lets a new scan
+// skip rehashing files whose content is already known.
+//
+// This file implements the two-layer reuse lookup used by the walker:
+//
+//  1. Exact-root reuse: before a scan starts, inventory.go preloads reusable
+//     entries from the current authoritative scan for the same root plus the
+//     newest failed interrupted scan for that root. Those entries are grouped
+//     by relative path because multiple candidates can now exist for the same
+//     file path. During lookup, a candidate is reusable only when its size and
+//     mtime_ns match the file currently being walked.
+//  2. Overlap reuse: if the exact-root lookup misses, the walker can lazily
+//     consult other authoritative scans from the same machine whose roots
+//     overlap the target root. Ancestor roots are translated by stripping the
+//     target root's prefix from the source relative path; descendant roots are
+//     translated by prepending the descendant root's relative prefix.
+//
+// The safety rule for both layers is the same: matching metadata is necessary
+// but not sufficient when multiple candidates exist. If more than one candidate
+// matches rel_path + size + mtime_ns and those candidates disagree on
+// fingerprint or SHA-256, lookup intentionally returns a miss so the file is
+// hashed fresh. That keeps reuse deterministic and prevents a failed
+// interrupted scan from overriding a conflicting authoritative result simply by
+// being merged first.
+//
+// The overlap index is loaded lazily because ordinary rescans usually find most
+// reuse opportunities in the exact-root cache. Avoiding the overlap query on
+// the common path keeps startup fast while still allowing same-machine
+// ancestor/descendant scans to rescue reuse on exact misses.
 package inventory
 
 import (
@@ -11,15 +40,30 @@ import (
 // reuseSources is stateful and not safe for concurrent use.
 // The walker consults it from a single goroutine.
 type reuseSources struct {
-	exact         map[string]PrevEntry
+	exact         map[string][]PrevEntry
 	overlap       overlapReuseIndex
 	loadOverlap   func() (overlapReuseIndex, error)
 	overlapLoaded bool
 }
 
 func (s *reuseSources) lookup(relPath string, size, mtimeNS int64) (PrevEntry, bool, error) {
-	if prev, ok := s.exact[relPath]; ok && prev.Size == size && prev.MtimeNS == mtimeNS {
-		return prev, true, nil
+	var matched PrevEntry
+	found := false
+	for _, prev := range s.exact[relPath] {
+		if prev.Size != size || prev.MtimeNS != mtimeNS {
+			continue
+		}
+		if !found {
+			matched = prev
+			found = true
+			continue
+		}
+		if matched.Fingerprint != prev.Fingerprint || matched.SHA256 != prev.SHA256 {
+			return PrevEntry{}, false, nil
+		}
+	}
+	if found {
+		return matched, true, nil
 	}
 
 	if !s.overlapLoaded {

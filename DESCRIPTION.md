@@ -26,23 +26,34 @@ go run ./cmd/sympath /path/to/root
 ```
 
 On each run, the CLI ensures `~/.sympath` exists, seeds a documented
-blank `~/.sympath/remotes` file if one is missing, ensures a stable
-`~/.sympath/machine-id` file exists, optionally fetches remote
-`~/.sympath/*.sympath` databases listed in `remotes`, consolidates the
-local and fetched databases into one surviving local database file, and
-then scans into that file. If no database exists yet, it creates a new
-random 10-character alphanumeric `.sympath` filename with
-`NewRandomSympathFilename()`. Pass `--verbose` to print startup messages
-about directory creation, remote fetching, consolidation, and the final
-database path in use. When stderr is an interactive terminal, the CLI
-also renders a live in-place scan progress line with an ASCII spinner,
-a bouncing track, and running file counts.
+`~/.sympath/remotes` file with a comment template if one is missing, and
+ensures a stable `~/.sympath/machine-id` file exists. When no other scan is
+active, startup may fetch remote `~/.sympath/*.sympath` databases listed in
+`remotes` and consolidate the local and fetched databases into one surviving
+local database file before scanning into it. If another disjoint scan is
+already active, the new scan joins the shared DB guard and reuses the current
+local database without running a new consolidation pass. If no database exists
+yet, startup creates a new random 10-character alphanumeric `.sympath`
+filename with `NewRandomSympathFilename()`. Pass `--verbose` to print startup
+messages about directory creation, remote fetching, consolidation or database
+reuse, and the final database path in use. When stderr is an interactive
+terminal, the CLI also renders a live in-place scan progress line with an
+ASCII spinner, a bouncing track, and running file counts.
+
+The `sympath ui` command follows the same local startup discipline, but with a
+different lifetime model: it takes the startup lock plus the global DB guard
+exclusively, consolidates only local databases, opens the chosen database
+read-only while those locks are still held, and then releases both locks
+before serving HTTP. That intentionally makes the UI a best-effort snapshot of
+the database it opened at startup. Later scans may reconsolidate and publish a
+newer database while the UI keeps serving the already-open snapshot.
 
 Each call produces a complete snapshot of every regular file under `root`.
-Subsequent calls first reuse hashes from the previous snapshot for that exact
-root and can also fall back to overlapping authoritative scans on the same
-machine when a file's size and modification time are unchanged, making
-re-scans of mostly-static trees very fast.
+Subsequent calls first reuse hashes from the current authoritative snapshot
+and the newest failed interrupted scan for that exact root, then can fall
+back to overlapping authoritative scans on the same machine when a file's
+size and modification time are unchanged, making re-scans of mostly-static
+trees very fast.
 
 ## Design Principles
 
@@ -83,30 +94,80 @@ Walker (1 goroutine)
 
 ### Incremental Reuse
 
-Before starting a new scan the exact previous scan's entries are preloaded into
-an in-memory map keyed by relative path. During the walk, if a file's `(size,
-mtime_ns)` match the exact previous entry, its fingerprint and SHA-256 are
-copied directly into the new scan and the file is not re-read. On an exact
-miss, the walker can lazily consult overlapping authoritative scans from the
-same machine by translating their relative paths into the target root's
-coordinate system. On a tree where 90% of files are unchanged, this skips 90%
-of disk I/O.
+Before starting a new scan, exact-root reusable entries from the current
+authoritative scan and the newest failed interrupted scan are preloaded into
+an in-memory candidate map keyed by relative path. During the walk, if a
+file's `(size, mtime_ns)` match an exact candidate and all matching
+candidates agree on `fingerprint` and `sha256`, those hashes are copied
+directly into the new scan and the file is not re-read. On an exact miss, the
+walker can lazily consult overlapping authoritative scans from the same
+machine by translating their relative paths into the target root's coordinate
+system. On a tree where 90% of files are unchanged, this skips 90% of disk
+I/O.
 
 ### Scan Lifecycle
 
 ```
-1. Read roots.current_scan_id -> preload exact previous entries
-2. INSERT into scans (status = 'running')
-3. Walk tree, reusing exact matches first and consulting overlapping
+1. Acquire a startup lock and normalize the root
+2. Try to acquire the global DB guard exclusively:
+     a. if successful, resolve the consolidated DB (including remote fetch and
+        consolidation when needed), acquire the per-root scan lock, initialize
+        the DB if needed, then downgrade the DB guard to shared mode
+     b. if another scan already holds the DB guard shared, join it in shared
+        mode, reuse the existing local DB without consolidation, and acquire
+        the per-root scan lock
+3. Release the startup lock and keep the shared DB guard plus the per-root
+   scan lock for the duration of the scan
+4. Mark any lingering `scans.status = 'running'` rows for this
+   machine/root as `failed`
+5. Read roots.current_scan_id plus the newest failed interrupted scan for
+   this machine/root -> preload exact reuse candidates
+6. INSERT into scans (status = 'running')
+7. Walk tree, reusing exact matches first and consulting overlapping
    authoritative roots on same-machine misses; emit base entries + hash jobs
-4. Workers drain job queue, emit results
-5. Writer flushes all inserts and updates
-6. Publish (single short transaction):
+8. Workers drain job queue, emit results
+9. Writer flushes all inserts and updates
+10. Publish (single short transaction):
      a. UPDATE scans SET status = 'complete'
      b. UPSERT roots.current_scan_id
      c. DELETE all other scans for this root (CASCADE deletes entries)
-7. On failure: mark scan 'failed', leave previous scan as authoritative
+11. On failure: mark scan 'failed', leave previous scan as authoritative
 ```
+
+### Locking Model
+
+The concurrency model relies on three distinct locks, each with a different
+scope and lifetime:
+
+- **Startup lock**: A short-lived process lock around the startup transition
+  where a command decides which database file to use and which longer-lived
+  locks it should take. This prevents two processes from simultaneously
+  inspecting the lock set and making conflicting startup decisions.
+- **Global DB guard**: A lock over the shared `~/.sympath` database set. Active
+  scans hold it in shared mode for their full lifetime so the chosen local
+  database cannot be consolidated away underneath them. Consolidation paths
+  such as scan startup without an already-active scan, and `sympath ui`
+  startup, take it exclusively while selecting and opening the database they
+  need.
+- **Per-root scan lock**: A long-lived lock keyed by `(machine_id, normalized
+  root)` and annotated with metadata describing that root. This lock rejects
+  overlapping roots on the same machine while still allowing disjoint roots to
+  scan concurrently.
+
+| Lock               | Scope                                       | Held By                                                              | Held For                                                                       | Prevents                                                                  |
+|--------------------|---------------------------------------------|----------------------------------------------------------------------|--------------------------------------------------------------------------------|---------------------------------------------------------------------------|
+| Startup lock       | Whole local `~/.sympath` startup transition | `scan`, `ui`                                                         | Only while choosing the DB and acquiring longer-lived locks                    | Two processes making conflicting startup decisions at the same time       |
+| Global DB guard    | Shared local database set in `~/.sympath`   | `scan` in shared mode; startup/consolidation paths in exclusive mode | Shared for the full scan lifetime; exclusive only while selecting/opening a DB | Consolidation replacing or deleting the live DB underneath an active scan |
+| Per-root scan lock | One normalized root on one machine          | `scan`                                                               | Full scan lifetime                                                             | Concurrent overlapping scans for the same machine                         |
+
+Together these locks enforce the intended concurrency policy:
+
+- Two disjoint scans can run at the same time.
+- Two overlapping scans cannot run at the same time.
+- Consolidation cannot replace or delete the live database while a scan is
+  actively using it.
+- The UI opens a database under startup protection, then intentionally releases
+  the locks and serves that already-open database as a best-effort snapshot.
 
 ## Database Schema
 
@@ -254,9 +315,10 @@ inventory.go          InventoryTree orchestration, scan lifecycle, publish and g
   NVMe.
 - **Buffer reuse**: Each worker allocates a single 1MB read buffer at startup
   and reuses it across all files.
-- **Exact-root fast path**: The previous scan for the same root is loaded into
-  a `map[string]PrevEntry` before the walk begins, making unchanged-file reuse
-  O(1).
+- **Exact-root fast path**: Exact-root candidates from the authoritative scan
+  plus the newest failed interrupted scan are loaded into a
+  `map[string][]PrevEntry` before the walk begins, making unchanged-file reuse
+  O(1) while still allowing conflicting candidates to be rejected safely.
 - **Lazy overlap fallback**: Overlapping authoritative scans on the same
   machine are only loaded after an exact-root miss, so ordinary rescans keep
   the old fast path.
@@ -265,12 +327,26 @@ inventory.go          InventoryTree orchestration, scan lifecycle, publish and g
 
 ## Crash Safety
 
-- If the process is interrupted during a scan, the incomplete scan row remains
-  with `status = 'running'`. The `roots.current_scan_id` pointer is never
+- If the CLI handles `SIGINT` or `SIGTERM` cleanly during a scan, the in-flight
+  scan is marked `failed` with a `finished_at` timestamp. Hard kills or crashes
+  may still leave an orphaned `running` row.
+- Before a new scan starts hashing, it acquires an overlap-aware per-root scan
+  lock. Once that lock is held, any same-root `running` rows are known to be
+  orphaned and are immediately adopted to `failed`.
+- Interrupted scans stay non-authoritative: `roots.current_scan_id` is never
   updated, so the previous completed scan remains authoritative.
-- On the next successful run, the publish step's `DELETE FROM scans WHERE
-  root=? AND scan_id <> ?` cleans up both the previous completed scan and any
-  orphaned running/failed scans in a single operation.
+- On the next scan for the same machine/root, the newest failed interrupted
+  scan is consulted as an additional exact-match reuse cache for entries whose
+  `state IN ('ok', 'reused')` and whose `(rel_path, size, mtime_ns)` still
+  match.
+- The global DB guard prevents consolidation from renaming or deleting the live
+  database while scans are active. Disjoint roots can still scan concurrently
+  by sharing that guard in read mode, while overlapping roots remain
+  serialized by the per-root scan lock.
+- On the next successful run, the publish step's
+  `DELETE FROM scans WHERE machine_id=? AND root=? AND scan_id <> ?` cleans up
+  both the previous completed scan and any orphaned running/failed scans in a
+  single operation.
 - SQLite's WAL journaling ensures the database file is never structurally
   corrupted by an unclean shutdown.
 

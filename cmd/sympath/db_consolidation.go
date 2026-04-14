@@ -151,6 +151,39 @@ func resolveRunDBPath(ctx context.Context, transport remoteTransport, logger ver
 	}, nil
 }
 
+func resolveExistingRunDBPath(logger verboseLogger) (startupState, error) {
+	dir, err := sympathStateDir()
+	if err != nil {
+		return startupState{}, fmt.Errorf("resolve sympath state directory: %w", err)
+	}
+
+	if err := ensureSympathDir(dir, logger); err != nil {
+		return startupState{}, err
+	}
+
+	identity, err := ensureMachineIdentity(dir, logger)
+	if err != nil {
+		return startupState{}, err
+	}
+
+	localDBs, err := listSympathDBs(dir)
+	if err != nil {
+		return startupState{}, err
+	}
+	if len(localDBs) == 0 {
+		return startupState{}, errors.New("another scan is active but no consolidated database exists yet")
+	}
+	if len(localDBs) > 1 {
+		return startupState{}, fmt.Errorf("another scan is active and consolidation is required; found %d local .sympath files", len(localDBs))
+	}
+
+	logger.Printf("Using existing database while another scan is active: %s", localDBs[0])
+	return startupState{
+		DBPath:   localDBs[0],
+		Identity: identity,
+	}, nil
+}
+
 func consolidateSympathDir(
 	ctx context.Context,
 	dir string,
