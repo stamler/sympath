@@ -49,6 +49,7 @@ func runWalker(
 	excludeSet map[string]struct{},
 	entryCh chan<- baseEntry,
 	jobCh chan<- HashJob,
+	progress *ScanProgress,
 ) error {
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		// Check for cancellation
@@ -67,13 +68,15 @@ func runWalker(
 			rel, relErr := filepath.Rel(root, path)
 			if relErr == nil {
 				rel = filepath.ToSlash(rel)
-				entryCh <- baseEntry{
+				entry := baseEntry{
 					RelPath: rel,
 					Name:    filepath.Base(rel),
 					Ext:     strings.ToLower(filepath.Ext(filepath.Base(rel))),
 					State:   "error",
 					ErrMsg:  walkErr.Error(),
 				}
+				entryCh <- entry
+				progress.noteDiscovered(entry.State)
 			}
 			return nil
 		}
@@ -119,7 +122,7 @@ func runWalker(
 		// Check if we can reuse the previous scan's hashes
 		if prev, ok := prevEntries[rel]; ok {
 			if prev.Size == size && prev.MtimeNS == mtimeNS {
-				entryCh <- baseEntry{
+				entry := baseEntry{
 					RelPath:     rel,
 					Name:        name,
 					Ext:         ext,
@@ -129,12 +132,14 @@ func runWalker(
 					Fingerprint: prev.Fingerprint,
 					SHA256:      prev.SHA256,
 				}
+				entryCh <- entry
+				progress.noteDiscovered(entry.State)
 				return nil
 			}
 		}
 
 		// File needs hashing
-		entryCh <- baseEntry{
+		entry := baseEntry{
 			RelPath: rel,
 			Name:    name,
 			Ext:     ext,
@@ -142,6 +147,8 @@ func runWalker(
 			MtimeNS: mtimeNS,
 			State:   "pending",
 		}
+		entryCh <- entry
+		progress.noteDiscovered(entry.State)
 
 		jobCh <- HashJob{
 			AbsPath: absPath,

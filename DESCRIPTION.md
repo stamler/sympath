@@ -34,7 +34,9 @@ then scans into that file. If no database exists yet, it creates a new
 random 10-character alphanumeric `.sympath` filename with
 `NewRandomSympathFilename()`. Pass `--verbose` to print startup messages
 about directory creation, remote fetching, consolidation, and the final
-database path in use.
+database path in use. When stderr is an interactive terminal, the CLI
+also renders a live in-place scan progress line with an ASCII spinner,
+a bouncing track, and running file counts.
 
 Each call produces a complete snapshot of every regular file under `root`.
 Subsequent calls reuse hashes from the previous snapshot when a file's size

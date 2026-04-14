@@ -161,7 +161,7 @@ func appendLast(lastBuf, chunk []byte, maxSize int) []byte {
 // allocates a 1MB read buffer once and reuses it across all files. If
 // a file is detected as unstable (changed during read), the worker
 // retries once before marking the result as unstable.
-func hashWorker(ctx context.Context, jobs <-chan HashJob, results chan<- HashResult) {
+func hashWorker(ctx context.Context, jobs <-chan HashJob, results chan<- HashResult, progress *ScanProgress) {
 	buf := make([]byte, readBufSize)
 	for {
 		select {
@@ -180,6 +180,7 @@ func hashWorker(ctx context.Context, jobs <-chan HashJob, results chan<- HashRes
 			}
 			select {
 			case results <- r:
+				progress.noteHashed()
 			case <-ctx.Done():
 				return
 			}

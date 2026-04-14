@@ -115,8 +115,20 @@ func runScanWithIO(args []string, stdout, stderr io.Writer) error {
 	if err := inventory.PrepareLocalMachineDB(ctx, db, startup.Identity); err != nil {
 		return fmt.Errorf("prepare database: %w", err)
 	}
-	if err := inventory.InventoryTree(ctx, db, root); err != nil {
+
+	progress, display := newScanProgressDisplay(stderr)
+	if display != nil {
+		display.Start()
+	}
+
+	if err := inventory.InventoryTreeWithProgress(ctx, db, root, progress); err != nil {
+		if display != nil {
+			display.Stop()
+		}
 		return fmt.Errorf("inventory tree: %w", err)
+	}
+	if display != nil {
+		display.Stop()
 	}
 
 	normalizedRoot, err := normalizePath(root)

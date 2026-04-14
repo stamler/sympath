@@ -47,6 +47,12 @@ import (
 // The pipeline uses min(NumCPU, 4) hash workers to avoid disk thrashing
 // while still saturating SHA-256 throughput on fast storage.
 func InventoryTree(ctx context.Context, db *sql.DB, root string) error {
+	return InventoryTreeWithProgress(ctx, db, root, nil)
+}
+
+// InventoryTreeWithProgress behaves like [InventoryTree] and also updates
+// progress while the scan is running when progress is non-nil.
+func InventoryTreeWithProgress(ctx context.Context, db *sql.DB, root string, progress *ScanProgress) error {
 	// Normalize root path
 	absRoot, err := resolveAbsPath(root)
 	if err != nil {
@@ -112,13 +118,14 @@ func InventoryTree(ctx context.Context, db *sql.DB, root string) error {
 	for i := 0; i < numWorkers; i++ {
 		go func() {
 			defer wg.Done()
-			hashWorker(ctx, jobCh, resultCh)
+			hashWorker(ctx, jobCh, resultCh, progress)
 		}()
 	}
 
 	// Start walker
 	go func() {
-		walkerErr = runWalker(ctx, absRoot, prevEntries, excludeSet, entryCh, jobCh)
+		walkerErr = runWalker(ctx, absRoot, prevEntries, excludeSet, entryCh, jobCh, progress)
+		progress.noteWalkComplete()
 		close(entryCh)
 		close(jobCh)
 	}()

@@ -82,6 +82,10 @@ sympath version
 
 Running `sympath` without a subcommand behaves like `sympath scan`.
 
+Interactive scans show a live progress line on `stderr` with a spinner,
+an ASCII bouncing track, and running file counts while the inventory is
+being built.
+
 ## Remotes
 
 The installer does not create or populate `~/.sympath/remotes`. Remote aggregation stays manual.
