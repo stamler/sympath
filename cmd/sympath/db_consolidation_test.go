@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -368,6 +369,90 @@ func TestConsolidateSympathDir_RemovingRemotePurgesItsMachineData(t *testing.T) 
 	}
 	if got := countDistinctMachineIDs(t, db); got != 1 {
 		t.Fatalf("expected only the local machine after removing the remote, got %d", got)
+	}
+}
+
+func TestBuildRemoteShellCommand_QuotesScriptForSSH(t *testing.T) {
+	script := `printf '%s\n' "path with spaces; and quote ' inside"`
+
+	output, err := exec.Command("sh", "-c", buildRemoteShellCommand(script)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected quoted command to execute, got %v with output %q", err, string(output))
+	}
+
+	if got, want := string(output), "path with spaces; and quote ' inside\n"; got != want {
+		t.Fatalf("expected output %q, got %q", want, got)
+	}
+}
+
+func TestParseRemoteDBPath(t *testing.T) {
+	tests := []struct {
+		name    string
+		output  string
+		want    string
+		wantErr string
+	}{
+		{
+			name:   "single path",
+			output: "/root/.sympath/current.sympath\n",
+			want:   "/root/.sympath/current.sympath",
+		},
+		{
+			name:    "empty output",
+			output:  "",
+			wantErr: "no remote ~/.sympath/*.sympath file found",
+		},
+		{
+			name: "mixed output",
+			output: strings.Join([]string{
+				"Last login: Mon Apr 13 21:23:23 2026",
+				"/root/.sympath/older.sympath",
+				"warning banner",
+				"/root/.sympath/newest.sympath",
+				"",
+			}, "\n"),
+			want: "/root/.sympath/newest.sympath",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseRemoteDBPath([]byte(tc.output))
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error %q, got nil", tc.wantErr)
+				}
+				if err.Error() != tc.wantErr {
+					t.Fatalf("expected error %q, got %q", tc.wantErr, err.Error())
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("expected no error, got %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("expected %q, got %q", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestFormatCommandError_PreservesCommandOutput(t *testing.T) {
+	output, err := exec.Command("sh", "-c", "printf 'banner\\n'; printf >&2 'permission denied\\n'; exit 255").CombinedOutput()
+	if err == nil {
+		t.Fatal("expected command failure")
+	}
+
+	got := formatCommandError("locate remote database via ssh", err, output).Error()
+	if !strings.Contains(got, "locate remote database via ssh") {
+		t.Fatalf("expected action prefix in %q", got)
+	}
+	if !strings.Contains(got, "exit status 255") {
+		t.Fatalf("expected exit status in %q", got)
+	}
+	if !strings.Contains(got, "permission denied") {
+		t.Fatalf("expected stderr text in %q", got)
 	}
 }
 

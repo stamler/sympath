@@ -51,6 +51,8 @@ const (
 	unknownHostnameName  = "unknown-host"
 )
 
+const remoteDBLookupScript = `ls -1t "$HOME"/.sympath/*.sympath 2>/dev/null | head -n 1`
+
 const remotesFileTemplate = `# sympath remotes configuration
 #
 # If this file contains one or more remote entries, this machine acts as
@@ -619,16 +621,15 @@ func removeDBArtifacts(path string, logger verboseLogger) error {
 	return nil
 }
 
-func (shellRemoteTransport) LocateRemoteDB(ctx context.Context, target string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, remoteCommandTimeout)
-	defer cancel()
+func buildRemoteShellCommand(script string) string {
+	return "sh -c " + quotePOSIXShellToken(script)
+}
 
-	cmd := exec.CommandContext(ctx, "ssh", target, "sh", "-c", `set -- "$HOME"/.sympath/*.sympath; [ -e "$1" ] || exit 1; ls -1t "$HOME"/.sympath/*.sympath 2>/dev/null | head -n 1`)
-	output, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("locate remote database via ssh: %w", err)
-	}
+func quotePOSIXShellToken(token string) string {
+	return "'" + strings.ReplaceAll(token, "'", `'"'"'`) + "'"
+}
 
+func parseRemoteDBPath(output []byte) (string, error) {
 	var path string
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
@@ -644,17 +645,34 @@ func (shellRemoteTransport) LocateRemoteDB(ctx context.Context, target string) (
 	return path, nil
 }
 
+func formatCommandError(action string, err error, output []byte) error {
+	trimmed := strings.TrimSpace(string(output))
+	if trimmed != "" {
+		return fmt.Errorf("%s: %w: %s", action, err, trimmed)
+	}
+	return fmt.Errorf("%s: %w", action, err)
+}
+
+func (shellRemoteTransport) LocateRemoteDB(ctx context.Context, target string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, remoteCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ssh", target, buildRemoteShellCommand(remoteDBLookupScript))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", formatCommandError("locate remote database via ssh", err, output)
+	}
+
+	return parseRemoteDBPath(output)
+}
+
 func (shellRemoteTransport) FetchRemoteDB(ctx context.Context, target, remotePath, localPath string) error {
 	ctx, cancel := context.WithTimeout(ctx, remoteCommandTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "scp", "-q", fmt.Sprintf("%s:%s", target, remotePath), localPath)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		trimmed := strings.TrimSpace(string(output))
-		if trimmed != "" {
-			return fmt.Errorf("copy remote database via scp: %w: %s", err, trimmed)
-		}
-		return fmt.Errorf("copy remote database via scp: %w", err)
+		return formatCommandError("copy remote database via scp", err, output)
 	}
 	return nil
 }
