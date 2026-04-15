@@ -87,6 +87,43 @@ func TestRunScan_VerboseReportsDatabaseSetup(t *testing.T) {
 	}
 }
 
+func TestRunScan_DefaultLogsProgressOnly(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(t.TempDir(), "scan-root")
+	t.Setenv("HOME", home)
+
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "file.txt"), []byte("content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := runScanWithIO([]string{root}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "INFO: Scanning files:") {
+		t.Fatalf("expected scan progress line, got:\n%s", errOut)
+	}
+	for _, unwanted := range []string{
+		"Preparing scan for ",
+		"Preparing startup database in ",
+		"Starting local scan of ",
+		"Using database: ",
+	} {
+		if strings.Contains(errOut, unwanted) {
+			t.Fatalf("did not expect setup chatter %q, got:\n%s", unwanted, errOut)
+		}
+	}
+	if !strings.Contains(stdout.String(), "Scan complete") {
+		t.Fatalf("expected scan summary on stdout, got:\n%s", stdout.String())
+	}
+}
+
 func TestRunScan_VerboseReportsInterruptedResumeSource(t *testing.T) {
 	home := t.TempDir()
 	root := filepath.Join(t.TempDir(), "scan-root")

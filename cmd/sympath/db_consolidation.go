@@ -111,6 +111,10 @@ type remoteTransport interface {
 	FetchRemoteDB(ctx context.Context, target, remotePath, localPath string) error
 }
 
+type remoteFetchSkipper interface {
+	SkipRemoteFetchReason() string
+}
+
 type shellRemoteTransport struct{}
 
 type startupState struct {
@@ -130,6 +134,7 @@ func resolveRunDBPath(ctx context.Context, transport remoteTransport, logger ver
 	if err != nil {
 		return startupState{}, fmt.Errorf("resolve sympath state directory: %w", err)
 	}
+	logger.Debugf("Preparing startup database in %s", dir)
 
 	if err := ensureSympathDir(dir, logger); err != nil {
 		return startupState{}, err
@@ -177,7 +182,7 @@ func resolveExistingRunDBPath(logger verboseLogger) (startupState, error) {
 		return startupState{}, fmt.Errorf("another scan is active and consolidation is required; found %d local .sympath files", len(localDBs))
 	}
 
-	logger.Printf("Using existing database while another scan is active: %s", localDBs[0])
+	logger.Debugf("Using existing database while another scan is active: %s", localDBs[0])
 	return startupState{
 		DBPath:   localDBs[0],
 		Identity: identity,
@@ -225,13 +230,13 @@ func consolidateSympathDir(
 			return "", fmt.Errorf("generate random database filename: %w", err)
 		}
 		dbPath := filepath.Join(dir, filename)
-		logger.Printf("No .sympath databases found in %s", dir)
-		logger.Printf("Created new database path: %s", dbPath)
+		logger.Debugf("No .sympath databases found in %s", dir)
+		logger.Debugf("Created new database path: %s", dbPath)
 		return dbPath, nil
 	}
 
 	if !needsConsolidation && len(localDBs) == 1 {
-		logger.Printf("Using existing database without consolidation: %s", localDBs[0])
+		logger.Debugf("Using existing database without consolidation: %s", localDBs[0])
 		return localDBs[0], nil
 	}
 
@@ -260,31 +265,42 @@ func consolidateSympathDir(
 		return "", fmt.Errorf("prepare consolidation database %q: %w", targetPath, err)
 	}
 
-	logger.Printf("Consolidating %d local database file(s) and %d fetched remote file(s) in %s", len(localDBs), len(fetched), dir)
-	for _, path := range localDBs {
-		if err := importLocalDB(ctx, targetDB, path, identity, logger); err != nil {
+	logger.Debugf("Consolidating %d local database file(s) and %d fetched remote file(s) in %s", len(localDBs), len(fetched), dir)
+	mergeProgress := newItemProgressDisplay(logger, "Merging")
+	defer mergeProgress.Stop()
+	for i, path := range localDBs {
+		label := formatMergeProgressLabel("local", i+1, len(localDBs)+len(fetched), filepath.Base(path))
+		mergeProgress.Advance(label, "Merging: "+label)
+		summary, err := importLocalDB(ctx, targetDB, path, identity, logger)
+		if err != nil {
+			logger.Errorf("Failed to merge local database %s: %v", path, err)
 			return "", err
 		}
+		logger.Debugf("Merged local database %d/%d: %s (%s)", i+1, len(localDBs), path, formatImportSummary(summary))
 	}
 
 	if len(removedMachineIDs) > 0 {
-		logger.Printf("Removing data for machine IDs from deleted remotes: %s", strings.Join(removedMachineIDs, ", "))
+		logger.Debugf("Removing data for machine IDs from deleted remotes: %s", strings.Join(removedMachineIDs, ", "))
 		if err := inventory.DeleteMachineData(ctx, targetDB, removedMachineIDs); err != nil {
 			return "", fmt.Errorf("purge deleted remote machine data: %w", err)
 		}
 	}
 
 	nextState := cloneRemoteState(state)
-	for _, remote := range fetched {
+	for i, remote := range fetched {
+		label := formatMergeProgressLabel("remote", len(localDBs)+i+1, len(localDBs)+len(fetched), remote.Alias)
+		mergeProgress.Advance(label, "Merging: "+label)
 		summary, err := importFetchedRemote(ctx, targetDB, remote.Path, logger)
 		if err != nil {
+			logger.Errorf("Failed to merge fetched remote %s: %v", remote.Alias, err)
 			return "", err
 		}
+		logger.Debugf("Merged fetched remote %d/%d: %s (%s)", i+1, len(fetched), remote.Alias, formatImportSummary(summary))
 
 		oldMachineIDs := nextState[remote.Alias]
 		staleMachineIDs := difference(oldMachineIDs, summary.MachineIDs)
 		if len(staleMachineIDs) > 0 {
-			logger.Printf("Removing stale machine IDs for remote %s: %s", remote.Alias, strings.Join(staleMachineIDs, ", "))
+			logger.Debugf("Removing stale machine IDs for remote %s: %s", remote.Alias, strings.Join(staleMachineIDs, ", "))
 			if err := inventory.DeleteMachineData(ctx, targetDB, staleMachineIDs); err != nil {
 				return "", fmt.Errorf("purge stale remote data for %s: %w", remote.Alias, err)
 			}
@@ -308,6 +324,7 @@ func consolidateSympathDir(
 		return "", err
 	}
 	if err := os.Rename(targetPath, finalPath); err != nil {
+		logger.Errorf("Failed to publish consolidated database %q: %v", targetPath, err)
 		cleanupFetchedFiles(fetched, logger)
 		return "", fmt.Errorf("rename consolidated database %q -> %q: %w", targetPath, finalPath, err)
 	}
@@ -321,10 +338,11 @@ func consolidateSympathDir(
 	cleanupFetchedFiles(fetched, logger)
 
 	if err := saveRemoteState(statePath, nextState); err != nil {
+		logger.Errorf("Failed to save remote state %q: %v", statePath, err)
 		return "", err
 	}
 
-	logger.Printf("Consolidated database: %s", finalPath)
+	logger.Debugf("Consolidated database: %s", finalPath)
 	return finalPath, nil
 }
 
@@ -334,7 +352,7 @@ func ensureSympathDir(dir string, logger verboseLogger) error {
 		return fmt.Errorf("create sympath directory %q: %w", dir, err)
 	}
 	if errors.Is(statErr, os.ErrNotExist) {
-		logger.Printf("Created database directory: %s", dir)
+		logger.Debugf("Created database directory: %s", dir)
 	}
 	return nil
 }
@@ -350,7 +368,7 @@ func ensureSeededRemotesFile(dir string, logger verboseLogger) error {
 	if err := os.WriteFile(path, []byte(remotesFileTemplate), 0644); err != nil {
 		return fmt.Errorf("seed remotes file %q: %w", path, err)
 	}
-	logger.Printf("Seeded remotes configuration file: %s", path)
+	logger.Debugf("Seeded remotes configuration file: %s", path)
 	return nil
 }
 
@@ -377,7 +395,7 @@ func ensureMachineIdentity(dir string, logger verboseLogger) (inventory.MachineI
 	if err := os.WriteFile(path, []byte(machineID+"\n"), 0644); err != nil {
 		return inventory.MachineIdentity{}, fmt.Errorf("write machine ID file %q: %w", path, err)
 	}
-	logger.Printf("Created machine ID file: %s", path)
+	logger.Debugf("Created machine ID file: %s", path)
 
 	return inventory.MachineIdentity{
 		MachineID: machineID,
@@ -461,13 +479,28 @@ func fetchRemotes(
 ) ([]fetchedRemote, map[string]struct{}, error) {
 	var fetched []fetchedRemote
 	succeeded := make(map[string]struct{})
-	for _, alias := range remotes {
-		logger.Printf("Fetching remote database from %s", alias)
+	if len(remotes) == 0 {
+		logger.Debugf("No remote databases configured")
+		return fetched, succeeded, nil
+	}
+	if skipper, ok := transport.(remoteFetchSkipper); ok {
+		logger.Debugf("Skipping fetch for %d configured remote database(s): %s", len(remotes), skipper.SkipRemoteFetchReason())
+		return fetched, succeeded, nil
+	}
+	logger.Debugf("Starting remote fetch for %d configured remote database(s)", len(remotes))
+	fetchProgress := newItemProgressDisplay(logger, "Fetching")
+	defer fetchProgress.Stop()
+	for i, alias := range remotes {
+		fetchProgress.Advance(
+			fmt.Sprintf("%s (%d/%d)", alias, i+1, len(remotes)),
+			fmt.Sprintf("Fetching %d/%d: %s", i+1, len(remotes), alias),
+		)
 		remotePath, err := transport.LocateRemoteDB(ctx, alias)
 		if err != nil {
 			logger.Warnf("Remote %s skipped: %v", alias, err)
 			continue
 		}
+		logger.Debugf("Located remote database for %s: %s", alias, remotePath)
 		localPath, err := newTempDBPath(dir, fetchTempPrefix)
 		if err != nil {
 			cleanupFetchedFiles(fetched, logger)
@@ -480,7 +513,10 @@ func fetchRemotes(
 		}
 		fetched = append(fetched, fetchedRemote{Alias: alias, Path: localPath})
 		succeeded[alias] = struct{}{}
+		logger.Debugf("Fetched remote database %d/%d: %s", i+1, len(remotes), alias)
+		logger.Debugf("Stored fetched remote %s at %s", alias, localPath)
 	}
+	logger.Debugf("Remote fetch complete: %d/%d succeeded", len(fetched), len(remotes))
 	return fetched, succeeded, nil
 }
 
@@ -490,25 +526,26 @@ func importLocalDB(
 	path string,
 	identity inventory.MachineIdentity,
 	logger verboseLogger,
-) error {
-	logger.Printf("Reading local database fragment: %s", path)
+) (inventory.ImportSummary, error) {
+	logger.Debugf("Reading local database fragment: %s", path)
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		return fmt.Errorf("open database %q: %w", path, err)
+		return inventory.ImportSummary{}, fmt.Errorf("open database %q: %w", path, err)
 	}
 	defer db.Close()
 
 	if err := inventory.PrepareLocalMachineDB(ctx, db, identity); err != nil {
-		return fmt.Errorf("prepare local database %q: %w", path, err)
+		return inventory.ImportSummary{}, fmt.Errorf("prepare local database %q: %w", path, err)
 	}
-	if _, err := inventory.ImportCurrentScans(ctx, target, db); err != nil {
-		return fmt.Errorf("import local database %q: %w", path, err)
+	summary, err := inventory.ImportCurrentScans(ctx, target, db)
+	if err != nil {
+		return inventory.ImportSummary{}, fmt.Errorf("import local database %q: %w", path, err)
 	}
-	return nil
+	return summary, nil
 }
 
 func importFetchedRemote(ctx context.Context, target *sql.DB, path string, logger verboseLogger) (inventory.ImportSummary, error) {
-	logger.Printf("Reading fetched remote database: %s", path)
+	logger.Debugf("Reading fetched remote database: %s", path)
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return inventory.ImportSummary{}, fmt.Errorf("open fetched remote database %q: %w", path, err)
@@ -603,6 +640,14 @@ func cleanupFetchedFiles(fetched []fetchedRemote, logger verboseLogger) {
 	}
 }
 
+func formatImportSummary(summary inventory.ImportSummary) string {
+	return fmt.Sprintf("%d root(s), %d machine(s)", summary.Roots, len(summary.MachineIDs))
+}
+
+func formatMergeProgressLabel(kind string, index, total int, label string) string {
+	return fmt.Sprintf("%s %d/%d: %s", kind, index, total, label)
+}
+
 func difference(left, right []string) []string {
 	rightSet := make(map[string]struct{}, len(right))
 	for _, id := range right {
@@ -648,7 +693,7 @@ func removeDBArtifacts(path string, logger verboseLogger) error {
 		if err := os.Remove(artifact); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove %q: %w", artifact, err)
 		} else if err == nil {
-			logger.Printf("Removed merged artifact: %s", artifact)
+			logger.Debugf("Removed merged artifact: %s", artifact)
 		}
 	}
 	return nil

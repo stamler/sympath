@@ -27,6 +27,10 @@ var uiStaticFS embed.FS
 // consolidating local .sympath files.
 type localOnlyTransport struct{}
 
+func (localOnlyTransport) SkipRemoteFetchReason() string {
+	return "UI startup uses local databases only"
+}
+
 func (localOnlyTransport) LocateRemoteDB(context.Context, string) (string, error) {
 	return "", errors.New("remote fetch disabled in ui mode")
 }
@@ -63,9 +67,8 @@ func runUIWithIO(args []string, stdout, stderr io.Writer) error {
 	}
 	defer dbGuard.Close()
 
-	// Suppress warnings from the local-only transport so remote
-	// "skipped" messages don't clutter the UI startup output.
-	logger := newVerboseLogger(stderr, false)
+	logger := newUILogger(stderr)
+	logger.Debugf("Preparing UI startup")
 
 	if err := ensureSympathDir(dir, logger); err != nil {
 		return err
@@ -74,6 +77,7 @@ func runUIWithIO(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	logger.Debugf("Consolidating local databases for UI startup")
 	dbPath, err := consolidateSympathDir(context.Background(), dir, identity, localOnlyTransport{}, logger)
 	if err != nil {
 		return err
@@ -81,6 +85,11 @@ func runUIWithIO(args []string, stdout, stderr io.Writer) error {
 	if err := requireExistingUIDatabase(dbPath); err != nil {
 		return err
 	}
+	normalizedDB, err := normalizeDBPath(dbPath)
+	if err != nil {
+		normalizedDB = dbPath
+	}
+	logger.Debugf("Opening database snapshot: %s", normalizedDB)
 
 	// Open the selected database while startupLock and the exclusive DB guard
 	// are still held. That closes the last startup race: a scan cannot
@@ -127,15 +136,12 @@ func runUIWithIO(args []string, stdout, stderr io.Writer) error {
 
 	addr := listener.Addr().(*net.TCPAddr)
 	url := fmt.Sprintf("http://127.0.0.1:%d", addr.Port)
+	logger.Debugf("Database: %s", normalizedDB)
+	logger.Infof("Serving UI at %s", url)
 
-	normalizedDB, err := normalizeDBPath(dbPath)
-	if err != nil {
-		normalizedDB = dbPath
+	if err := openBrowser(url); err != nil {
+		logger.Warnf("Failed to open browser automatically: %v", err)
 	}
-	fmt.Fprintf(stderr, "Database: %s\n", normalizedDB)
-	fmt.Fprintf(stderr, "Serving UI at %s\n", url)
-
-	_ = openBrowser(url)
 
 	// Graceful shutdown on interrupt.
 	sigCh := make(chan os.Signal, 1)

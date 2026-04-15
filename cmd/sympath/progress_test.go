@@ -57,17 +57,37 @@ func TestFormatScanProgressLine(t *testing.T) {
 		FilesProcessed:  567,
 		FilesPending:    667,
 	})
-	if !strings.Contains(scanning, "scanning files: 1,234 done: 567") {
+	if !strings.Contains(scanning, "Scanning files: 1,234 done: 567") {
 		t.Fatalf("expected scanning line, got %q", scanning)
 	}
+	if strings.Contains(scanning, "| [") {
+		t.Fatalf("expected no spinner prefix, got %q", scanning)
+	}
 
-	hashing := formatScanProgressLine(1, inventory.ScanProgressSnapshot{
+	walkComplete := formatScanProgressLine(1, inventory.ScanProgressSnapshot{
 		FilesDiscovered: 1234,
 		FilesProcessed:  1200,
 		FilesPending:    34,
 		WalkComplete:    true,
 	})
-	if !strings.Contains(hashing, "hashing  files: 1,234 done: 1,200") {
-		t.Fatalf("expected hashing line, got %q", hashing)
+	if !strings.Contains(walkComplete, "Scanning files: 1,234 done: 1,200") {
+		t.Fatalf("expected scanning line after walk completion, got %q", walkComplete)
+	}
+}
+
+func TestFormatScanProgressText(t *testing.T) {
+	got := formatScanProgressText(inventory.ScanProgressSnapshot{
+		FilesDiscovered: 1234,
+		FilesProcessed:  567,
+	})
+	if got != "Scanning files: 1,234 done: 567" {
+		t.Fatalf("expected non-tty scan text, got %q", got)
+	}
+}
+
+func TestFormatItemProgressLine(t *testing.T) {
+	got := formatItemProgressLine(3, "Fetching", "remote-a (1/2)")
+	if !strings.Contains(got, "Fetching: remote-a (1/2)") {
+		t.Fatalf("expected fetching line, got %q", got)
 	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -382,6 +383,62 @@ func TestRunUIWithIO_OpensDatabaseBeforeReleasingStartupProtection(t *testing.T)
 	err = runUIWithIO(nil, io.Discard, io.Discard)
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("expected sentinel error after probe, got %v", err)
+	}
+}
+
+func TestRunUIWithIO_DefaultLogsOnlyMergeProgress(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	stateDir, err := sympathStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	rootA := filepath.Join(t.TempDir(), "ui-root-a")
+	rootB := filepath.Join(t.TempDir(), "ui-root-b")
+	dbA := filepath.Join(stateDir, "aaa.sympath")
+	dbB := filepath.Join(stateDir, "bbb.sympath")
+
+	writeTree(t, rootA, map[string]string{"a.txt": "alpha"})
+	writeTree(t, rootB, map[string]string{"b.txt": "bravo"})
+	scanIntoDB(t, dbA, rootA)
+	scanIntoDB(t, dbB, rootB)
+
+	sentinel := errors.New("stop after logged UI open")
+	prevOpen := openUIReadOnlyDBForRunUI
+	openUIReadOnlyDBForRunUI = func(ctx context.Context, dbPath string) (*sql.DB, error) {
+		t.Helper()
+		return nil, sentinel
+	}
+	t.Cleanup(func() { openUIReadOnlyDBForRunUI = prevOpen })
+
+	var stderr bytes.Buffer
+	err = runUIWithIO(nil, io.Discard, &stderr)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected sentinel error after opening log, got %v", err)
+	}
+
+	logOut := stderr.String()
+	for _, want := range []string{
+		"INFO: Merging: local 1/2: aaa.sympath",
+		"INFO: Merging: local 2/2: bbb.sympath",
+	} {
+		if !strings.Contains(logOut, want) {
+			t.Fatalf("expected log containing %q, got:\n%s", want, logOut)
+		}
+	}
+	for _, unwanted := range []string{
+		"Preparing UI startup",
+		"Consolidating local databases for UI startup",
+		"Opening database snapshot:",
+		"Database:",
+	} {
+		if strings.Contains(logOut, unwanted) {
+			t.Fatalf("did not expect setup chatter %q, got:\n%s", unwanted, logOut)
+		}
 	}
 }
 

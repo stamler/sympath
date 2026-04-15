@@ -31,29 +31,6 @@ var inventoryScanWithProgress = inventory.InventoryTreeWithProgress
 
 const staleScanAdoptionTimeout = 5 * time.Second
 
-type verboseLogger struct {
-	w       io.Writer
-	enabled bool
-}
-
-func newVerboseLogger(w io.Writer, enabled bool) verboseLogger {
-	return verboseLogger{w: w, enabled: enabled}
-}
-
-func (l verboseLogger) Printf(format string, args ...any) {
-	if !l.enabled {
-		return
-	}
-	fmt.Fprintf(l.w, format+"\n", args...)
-}
-
-func (l verboseLogger) Warnf(format string, args ...any) {
-	if l.w == nil {
-		return
-	}
-	fmt.Fprintf(l.w, "Warning: "+format+"\n", args...)
-}
-
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
@@ -127,7 +104,7 @@ func runScanWithIO(args []string, stdout, stderr io.Writer) error {
 		root = fs.Arg(0)
 	}
 
-	logger := newVerboseLogger(stderr, *verbose)
+	logger := newScanLogger(stderr, *verbose)
 
 	ctx, stop := newScanContext()
 	defer stop()
@@ -142,6 +119,7 @@ func runScanWithIO(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("normalize root path: %w", err)
 	}
+	logger.Debugf("Preparing scan for %s", normalizedRoot)
 	startupLock, err := acquireScanStartupLock(ctx, stateDir)
 	if err != nil {
 		return fmt.Errorf("acquire scan startup lock: %w", err)
@@ -240,20 +218,19 @@ func runScanWithIO(args []string, stdout, stderr io.Writer) error {
 	}
 	cancelAdopt()
 
-	if *verbose {
+	if logger.Enabled(logLevelDebug) {
 		interruptedScanID, reusableCount, err := loadInterruptedResumeInfo(ctx, db, startup.Identity.MachineID, normalizedRoot)
 		if err != nil {
 			return fmt.Errorf("load interrupted scan resume info: %w", err)
 		}
 		if interruptedScanID != 0 {
-			logger.Printf("Interrupted resume source: scan %d (%d reusable entries)", interruptedScanID, reusableCount)
+			logger.Debugf("Interrupted resume source: scan %d (%d reusable entries)", interruptedScanID, reusableCount)
 		}
 	}
 
-	progress, display := newScanProgressDisplay(stderr)
-	if display != nil {
-		display.Start()
-	}
+	logger.Debugf("Starting local scan of %s", normalizedRoot)
+	progress, display := newScanProgressDisplay(logger)
+	display.Start()
 
 	if err := inventoryScanWithProgress(ctx, db, root, progress); err != nil {
 		if display != nil {
@@ -269,7 +246,7 @@ func runScanWithIO(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("normalize database path: %w", err)
 	}
-	logger.Printf("Using database: %s", normalizedDB)
+	logger.Debugf("Using database: %s", normalizedDB)
 
 	summary, err := loadSummary(ctx, db, startup.Identity.MachineID, normalizedRoot)
 	if err != nil {
@@ -290,7 +267,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "  sympath [--verbose] [ROOT]\n\n")
 	fmt.Fprintf(w, "Scans ROOT into the consolidated SQLite inventory database in ~/.sympath.\n")
 	fmt.Fprintf(w, "If ROOT is omitted, the current directory is scanned.\n")
-	fmt.Fprintf(w, "Use --verbose to print database resolution and consolidation details.\n")
+	fmt.Fprintf(w, "Use --verbose to add debug-level startup and consolidation details.\n")
 	fmt.Fprintf(w, "On startup, ~/.sympath/remotes is seeded if missing, remotes may be fetched, and ~/.sympath/*.sympath files are consolidated into one file.\n\n")
 	fmt.Fprintf(w, "The ui command consolidates local databases (skipping remote fetch), opens the\n")
 	fmt.Fprintf(w, "chosen database as a read-only best-effort snapshot, then launches a web\n")

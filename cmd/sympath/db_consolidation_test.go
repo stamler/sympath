@@ -311,6 +311,94 @@ func TestConsolidateSympathDir_FetchesAndImportsRemoteDB(t *testing.T) {
 	}
 }
 
+func TestConsolidateSympathDir_LogsRemoteFetchAndMergeProgress(t *testing.T) {
+	dir := t.TempDir()
+	localRoot := filepath.Join(t.TempDir(), "local-root")
+	remoteRoot := filepath.Join(t.TempDir(), "remote-root")
+	localDB := filepath.Join(dir, "local.sympath")
+	remoteDB := filepath.Join(t.TempDir(), "remote.sympath")
+
+	writeTree(t, localRoot, map[string]string{"local.txt": "local"})
+	writeTree(t, remoteRoot, map[string]string{"remote.txt": "remote"})
+	scanIntoDBWithIdentity(t, localDB, localRoot, testMachineIdentity())
+	scanIntoDBWithIdentity(t, remoteDB, remoteRoot, inventory.MachineIdentity{
+		MachineID: "remote-machine",
+		Hostname:  "remote-host",
+	})
+
+	if err := os.WriteFile(filepath.Join(dir, remotesFileName), []byte("remote-a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	if _, err := consolidateSympathDir(
+		context.Background(),
+		dir,
+		testMachineIdentity(),
+		mapRemoteTransport{paths: map[string]string{"remote-a": remoteDB}},
+		newScanLogger(&logs, false),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	logOut := logs.String()
+	for _, want := range []string{
+		"INFO: Fetching 1/1: remote-a",
+		"INFO: Merging: local 1/2: local.sympath",
+		"INFO: Merging: remote 2/2: remote-a",
+	} {
+		if !strings.Contains(logOut, want) {
+			t.Fatalf("expected log containing %q, got:\n%s", want, logOut)
+		}
+	}
+	for _, unwanted := range []string{
+		"Starting remote fetch",
+		"Fetched remote database",
+		"Remote fetch complete",
+		"Consolidated database:",
+	} {
+		if strings.Contains(logOut, unwanted) {
+			t.Fatalf("did not expect setup/completion log %q, got:\n%s", unwanted, logOut)
+		}
+	}
+}
+
+func TestConsolidateSympathDir_LocalOnlyTransportKeepsSkipNarrationQuietByDefault(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(t.TempDir(), "local-root")
+	dbPath := filepath.Join(dir, "local.sympath")
+
+	writeTree(t, root, map[string]string{"local.txt": "local"})
+	scanIntoDB(t, dbPath, root)
+
+	if err := os.WriteFile(filepath.Join(dir, remotesFileName), []byte("remote-a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	path, err := consolidateSympathDir(
+		context.Background(),
+		dir,
+		testMachineIdentity(),
+		localOnlyTransport{},
+		newUILogger(&logs),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != dbPath {
+		t.Fatalf("expected UI-mode consolidation to reuse %q, got %q", dbPath, path)
+	}
+
+	logOut := logs.String()
+	if strings.Contains(logOut, "Skipping fetch for 1 configured remote database(s): UI startup uses local databases only") {
+		t.Fatalf("expected UI skip narration to stay quiet by default, got:\n%s", logOut)
+	}
+	if strings.Contains(logOut, "WARN: Remote remote-a skipped") {
+		t.Fatalf("expected UI mode to avoid per-remote warnings, got:\n%s", logOut)
+	}
+}
+
 func TestConsolidateSympathDir_RemovingRemotePurgesItsMachineData(t *testing.T) {
 	dir := t.TempDir()
 	localRoot := filepath.Join(t.TempDir(), "local-root")
