@@ -193,6 +193,14 @@ func compareHasDiff(diffs []fileDiffPair, relPath string) bool {
 	return false
 }
 
+func duplicateGroupPaths(group duplicateGroup) []string {
+	paths := make([]string, 0, len(group.Files))
+	for _, file := range group.Files {
+		paths = append(paths, file.RelPath)
+	}
+	return paths
+}
+
 func TestEntryCTEsBranching(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -607,11 +615,23 @@ func TestEmbeddedUIIncludesStatusMountAndExplicitCompareAction(t *testing.T) {
 	if !strings.Contains(html, "fetch('/api/status')") {
 		t.Fatalf("expected status fetch path in embedded UI, got:\n%s", html)
 	}
+	if !strings.Contains(html, "id=\"compare-tab\"") || !strings.Contains(html, "id=\"duplicates-tab\"") {
+		t.Fatalf("expected top-level compare and duplicates tabs in embedded UI, got:\n%s", html)
+	}
+	if !strings.Contains(html, "id=\"compare-panel\"") || !strings.Contains(html, "id=\"duplicates-panel\"") {
+		t.Fatalf("expected dedicated compare and duplicates panels in embedded UI, got:\n%s", html)
+	}
 	if !strings.Contains(html, "id=\"compare-button\"") {
 		t.Fatalf("expected explicit compare button in embedded UI, got:\n%s", html)
 	}
+	if !strings.Contains(html, "id=\"duplicates-button\"") {
+		t.Fatalf("expected explicit duplicates button in embedded UI, got:\n%s", html)
+	}
 	if !strings.Contains(html, "id=\"ignore-common-os\" checked") {
 		t.Fatalf("expected checked common OS ignore toggle in embedded UI, got:\n%s", html)
+	}
+	if !strings.Contains(html, "id=\"duplicates-ignore-common-os\" checked") {
+		t.Fatalf("expected checked duplicates common OS ignore toggle in embedded UI, got:\n%s", html)
 	}
 	if !strings.Contains(html, "id=\"collapse-missing-folders\" checked") {
 		t.Fatalf("expected checked collapse missing folders toggle in embedded UI, got:\n%s", html)
@@ -619,8 +639,14 @@ func TestEmbeddedUIIncludesStatusMountAndExplicitCompareAction(t *testing.T) {
 	if !strings.Contains(html, "compareButton.addEventListener('click', compare)") {
 		t.Fatalf("expected compare button click handler in embedded UI, got:\n%s", html)
 	}
+	if !strings.Contains(html, "duplicatesButton.addEventListener('click', findDuplicates)") {
+		t.Fatalf("expected duplicates button click handler in embedded UI, got:\n%s", html)
+	}
 	if !strings.Contains(html, "ignoreCommonOSBox.addEventListener('change', markCompareDirty)") {
 		t.Fatalf("expected common OS ignore toggle to dirty compare state, got:\n%s", html)
+	}
+	if !strings.Contains(html, "duplicatesIgnoreCommonOSBox.addEventListener('change', markDuplicatesDirty)") {
+		t.Fatalf("expected duplicates common OS ignore toggle to dirty duplicates state, got:\n%s", html)
 	}
 	if !strings.Contains(html, "localStorage.getItem(collapseMissingFoldersStorageKey)") {
 		t.Fatalf("expected collapse missing folders toggle to load persisted state, got:\n%s", html)
@@ -640,8 +666,14 @@ func TestEmbeddedUIIncludesStatusMountAndExplicitCompareAction(t *testing.T) {
 	if !strings.Contains(html, "params.set('ignore_common_os', '1')") {
 		t.Fatalf("expected compare requests to include ignore_common_os flag, got:\n%s", html)
 	}
+	if !strings.Contains(html, "fetch('/api/duplicates?' + requestKey)") {
+		t.Fatalf("expected duplicates requests to hit /api/duplicates, got:\n%s", html)
+	}
 	if strings.Contains(html, "setTimeout(compare, 400)") {
 		t.Fatalf("expected compare to be manually triggered, found auto-compare debounce in embedded UI:\n%s", html)
+	}
+	if strings.Contains(html, "setTimeout(findDuplicates") {
+		t.Fatalf("expected duplicates to be manually triggered, found auto-duplicates debounce in embedded UI:\n%s", html)
 	}
 	if !strings.Contains(html, ".replace(/'/g, '&#39;')") {
 		t.Fatalf("expected single-quote escaping in attribute helper, got:\n%s", html)
@@ -952,6 +984,181 @@ func TestHandleCompareMissingParams(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}
+
+func TestHandleDuplicates(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	scanID := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	insertUITestEntry(t, db, scanID, "dups/large-b.bin", 2048, "dup-large")
+	insertUITestEntry(t, db, scanID, "dups/large-a.bin", 2048, "dup-large")
+	insertUITestEntry(t, db, scanID, "dups/small-c.txt", 128, "dup-small")
+	insertUITestEntry(t, db, scanID, "dups/small-a.txt", 128, "dup-small")
+	insertUITestEntry(t, db, scanID, "dups/small-b.txt", 128, "dup-small")
+
+	req := httptest.NewRequest("GET", "/api/duplicates?machine_id=machine-a&root=/data/photos", nil)
+	rec := httptest.NewRecorder()
+	srv.handleDuplicates(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result duplicatesResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(result.Groups) != 2 {
+		t.Fatalf("expected 2 duplicate groups, got %d: %#v", len(result.Groups), result.Groups)
+	}
+	if result.Groups[0].Size != 2048 || result.Groups[0].SHA256 != "dup-large" {
+		t.Fatalf("expected largest group first, got %#v", result.Groups[0])
+	}
+	if got, want := duplicateGroupPaths(result.Groups[0]), []string{"dups/large-a.bin", "dups/large-b.bin"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected largest group paths:\n got %v\nwant %v", got, want)
+	}
+	if result.Groups[1].Size != 128 || result.Groups[1].SHA256 != "dup-small" {
+		t.Fatalf("expected smaller group second, got %#v", result.Groups[1])
+	}
+	if got, want := duplicateGroupPaths(result.Groups[1]), []string{"dups/small-a.txt", "dups/small-b.txt", "dups/small-c.txt"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected smaller group paths:\n got %v\nwant %v", got, want)
+	}
+}
+
+func TestHandleDuplicatesWithPrefix(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	scanID := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	insertUITestEntry(t, db, scanID, "albums/set1/b.flac", 4096, "album-dup")
+	insertUITestEntry(t, db, scanID, "albums/set1/a.flac", 4096, "album-dup")
+	insertUITestEntry(t, db, scanID, "albums/set2/c.flac", 4096, "album-dup")
+
+	req := httptest.NewRequest("GET", "/api/duplicates?machine_id=machine-a&root=/data/photos&prefix=albums/set1", nil)
+	rec := httptest.NewRecorder()
+	srv.handleDuplicates(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result duplicatesResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(result.Groups) != 1 {
+		t.Fatalf("expected 1 duplicate group under prefix, got %d: %#v", len(result.Groups), result.Groups)
+	}
+	if got, want := duplicateGroupPaths(result.Groups[0]), []string{"a.flac", "b.flac"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected prefix-stripped duplicate paths:\n got %v\nwant %v", got, want)
+	}
+}
+
+func TestHandleDuplicatesMissingParams(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	req := httptest.NewRequest("GET", "/api/duplicates?machine_id=machine-a", nil)
+	rec := httptest.NewRecorder()
+	srv.handleDuplicates(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}
+
+func TestHandleDuplicatesIgnoreCommonOSFiltersResults(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	scanID := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	insertUITestEntry(t, db, scanID, ".DS_Store", 10, "os-dup")
+	insertUITestEntry(t, db, scanID, "sub/.DS_Store", 10, "os-dup")
+
+	req := httptest.NewRequest("GET", "/api/duplicates?machine_id=machine-a&root=/data/photos", nil)
+	rec := httptest.NewRecorder()
+	srv.handleDuplicates(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 without ignore_common_os, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var withMetadata duplicatesResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &withMetadata); err != nil {
+		t.Fatal(err)
+	}
+	if len(withMetadata.Groups) != 1 {
+		t.Fatalf("expected metadata duplicates to be included without ignore_common_os, got %#v", withMetadata.Groups)
+	}
+
+	req = httptest.NewRequest("GET", "/api/duplicates?machine_id=machine-a&root=/data/photos&ignore_common_os=1", nil)
+	rec = httptest.NewRecorder()
+	srv.handleDuplicates(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with ignore_common_os, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var filtered duplicatesResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &filtered); err != nil {
+		t.Fatal(err)
+	}
+	if len(filtered.Groups) != 0 {
+		t.Fatalf("expected metadata duplicates to be filtered out, got %#v", filtered.Groups)
+	}
+}
+
+func TestHandleDuplicatesIgnoresMissingHashes(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	scanID := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	insertUITestEntry(t, db, scanID, "nohash/a.bin", 77, nil)
+	insertUITestEntry(t, db, scanID, "nohash/b.bin", 77, "")
+
+	req := httptest.NewRequest("GET", "/api/duplicates?machine_id=machine-a&root=/data/photos", nil)
+	rec := httptest.NewRecorder()
+	srv.handleDuplicates(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result duplicatesResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Groups == nil {
+		t.Fatal("expected non-nil duplicate groups slice")
+	}
+	if len(result.Groups) != 0 {
+		t.Fatalf("expected entries with missing hashes to be ignored, got %#v", result.Groups)
+	}
+}
+
+func TestHandleDuplicatesNoMatches(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	req := httptest.NewRequest("GET", "/api/duplicates?machine_id=machine-a&root=/data/photos", nil)
+	rec := httptest.NewRecorder()
+	srv.handleDuplicates(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result duplicatesResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Groups == nil {
+		t.Fatal("expected non-nil duplicate groups slice")
+	}
+	if len(result.Groups) != 0 {
+		t.Fatalf("expected no duplicate groups in baseline fixture, got %#v", result.Groups)
 	}
 }
 

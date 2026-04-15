@@ -151,3 +151,25 @@ func (s *uiServer) handleCompare(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
 }
+
+func (s *uiServer) handleDuplicates(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	machineID := q.Get("machine_id")
+	root := q.Get("root")
+	prefix := q.Get("prefix")
+	ignoreCommonOS := q.Get("ignore_common_os") == "1"
+
+	if machineID == "" || root == "" {
+		http.Error(w, "machine_id and root are required", http.StatusBadRequest)
+		return
+	}
+
+	result, err := findDuplicates(r.Context(), s.db, machineID, root, prefix, ignoreCommonOS)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}

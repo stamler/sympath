@@ -22,7 +22,22 @@ header h1 { font-size: 18px; font-weight: 600; }
 .status-pill a { color: inherit; text-decoration: none; }
 .status-pill a:hover { text-decoration: underline; }
 
+.tab-bar {
+  display: flex; gap: 8px; padding: 10px 24px 0;
+  background: #fff; border-bottom: 1px solid #ddd;
+}
+.tab-button {
+  border: 1px solid #d4d7dd; border-bottom: none; border-radius: 8px 8px 0 0;
+  padding: 9px 14px; font-size: 13px; font-weight: 600; color: #485060;
+  background: #f5f7fb; cursor: pointer;
+}
+.tab-button.active {
+  background: #fff; color: #1a1a2e; border-color: #cfd6e0;
+}
+.tab-panel[hidden] { display: none; }
+
 .selectors { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px 24px; background: #fff; border-bottom: 1px solid #ddd; }
+.selectors.single-column { grid-template-columns: minmax(0, 1fr); }
 .selector-col label { display: block; font-size: 12px; font-weight: 600; text-transform: uppercase; color: #666; margin-bottom: 4px; }
 .selector-col select { width: 100%; padding: 8px; font-size: 14px; border: 1px solid #ccc; border-radius: 4px; background: #fff; margin-bottom: 8px; }
 
@@ -75,6 +90,15 @@ td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; font-
 .diff td { background: #fff8f8; }
 .diff .changed { color: #c62828; font-weight: 600; }
 
+.duplicate-group td {
+  background: #eef4ff; color: #244365; font-weight: 600;
+}
+.duplicate-file td { padding-left: 24px; }
+.group-meta {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+}
+.group-hash { color: #4c6078; }
+
 .collapsed-path { color: #555; font-style: italic; }
 .collapsed-note { color: #777; font-style: normal; }
 
@@ -106,66 +130,136 @@ td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; font-
   <div class="app-status" id="app-status">Version loading...</div>
 </header>
 
-<div class="selectors">
-  <div class="selector-col">
-    <label>Left</label>
-    <select id="left-root"><option value="">Select a root...</option></select>
-    <div class="ac-wrap">
-      <span class="ghost" id="left-ghost"></span>
-      <input type="text" id="left-dir" placeholder="(entire root)" disabled autocomplete="off">
-      <div class="ac-list" id="left-list"></div>
+<div class="tab-bar" role="tablist" aria-label="Views">
+  <button type="button" class="tab-button active" id="compare-tab" data-tab="compare" role="tab" aria-selected="true" aria-controls="compare-panel">Compare</button>
+  <button type="button" class="tab-button" id="duplicates-tab" data-tab="duplicates" role="tab" aria-selected="false" aria-controls="duplicates-panel">Duplicates</button>
+</div>
+
+<section class="tab-panel" id="compare-panel" role="tabpanel" aria-labelledby="compare-tab">
+  <div class="selectors">
+    <div class="selector-col">
+      <label>Left</label>
+      <select id="left-root"><option value="">Select a root...</option></select>
+      <div class="ac-wrap">
+        <span class="ghost" id="left-ghost"></span>
+        <input type="text" id="left-dir" placeholder="(entire root)" disabled autocomplete="off">
+        <div class="ac-list" id="left-list"></div>
+      </div>
+    </div>
+    <div class="selector-col">
+      <label>Right</label>
+      <select id="right-root"><option value="">Select a root...</option></select>
+      <div class="ac-wrap">
+        <span class="ghost" id="right-ghost"></span>
+        <input type="text" id="right-dir" placeholder="(entire root)" disabled autocomplete="off">
+        <div class="ac-list" id="right-list"></div>
+      </div>
     </div>
   </div>
-  <div class="selector-col">
-    <label>Right</label>
-    <select id="right-root"><option value="">Select a root...</option></select>
-    <div class="ac-wrap">
-      <span class="ghost" id="right-ghost"></span>
-      <input type="text" id="right-dir" placeholder="(entire root)" disabled autocomplete="off">
-      <div class="ac-list" id="right-list"></div>
+
+  <div class="options">
+    <label><input type="checkbox" id="by-content"> Match by content (ignore path)</label>
+    <label><input type="checkbox" id="collapse-missing-folders" checked> Collapse fully missing folders</label>
+    <label><input type="checkbox" id="ignore-common-os" checked> Ignore common OS metadata files</label>
+    <div class="compare-controls">
+      <span class="compare-status" id="compare-status">Select a root on each side to compare.</span>
+      <button type="button" class="compare-button" id="compare-button" disabled>Compare</button>
     </div>
   </div>
-</div>
 
-<div class="options">
-  <label><input type="checkbox" id="by-content"> Match by content (ignore path)</label>
-  <label><input type="checkbox" id="collapse-missing-folders" checked> Collapse fully missing folders</label>
-  <label><input type="checkbox" id="ignore-common-os" checked> Ignore common OS metadata files</label>
-  <div class="compare-controls">
-    <span class="compare-status" id="compare-status">Select a root on each side to compare.</span>
-    <button type="button" class="compare-button" id="compare-button" disabled>Compare</button>
+  <div class="summary" id="compare-summary"></div>
+
+  <div class="results empty" id="compare-results">
+    Select a root on each side to compare.
   </div>
-</div>
+</section>
 
-<div class="summary" id="summary"></div>
+<section class="tab-panel" id="duplicates-panel" role="tabpanel" aria-labelledby="duplicates-tab" hidden>
+  <div class="selectors single-column">
+    <div class="selector-col">
+      <label>Root</label>
+      <select id="duplicates-root"><option value="">Select a root...</option></select>
+      <div class="ac-wrap">
+        <span class="ghost" id="duplicates-ghost"></span>
+        <input type="text" id="duplicates-dir" placeholder="(entire root)" disabled autocomplete="off">
+        <div class="ac-list" id="duplicates-list"></div>
+      </div>
+    </div>
+  </div>
 
-<div class="results empty" id="results">
-  Select a root on each side to compare.
-</div>
+  <div class="options">
+    <label><input type="checkbox" id="duplicates-ignore-common-os" checked> Ignore common OS metadata files</label>
+    <div class="compare-controls">
+      <span class="compare-status" id="duplicates-status">Select a root to search for duplicates.</span>
+      <button type="button" class="compare-button" id="duplicates-button" disabled>Find duplicates</button>
+    </div>
+  </div>
+
+  <div class="summary" id="duplicates-summary"></div>
+
+  <div class="results empty" id="duplicates-results">
+    Select a root to search for duplicates.
+  </div>
+</section>
 
 <script>
+const compareTabButton = document.getElementById('compare-tab');
+const duplicatesTabButton = document.getElementById('duplicates-tab');
+const comparePanel = document.getElementById('compare-panel');
+const duplicatesPanel = document.getElementById('duplicates-panel');
+
 const leftRootSel = document.getElementById('left-root');
 const rightRootSel = document.getElementById('right-root');
+const duplicatesRootSel = document.getElementById('duplicates-root');
 const byContentBox = document.getElementById('by-content');
 const collapseMissingFoldersBox = document.getElementById('collapse-missing-folders');
 const ignoreCommonOSBox = document.getElementById('ignore-common-os');
+const duplicatesIgnoreCommonOSBox = document.getElementById('duplicates-ignore-common-os');
 const compareButton = document.getElementById('compare-button');
+const duplicatesButton = document.getElementById('duplicates-button');
 const compareStatusEl = document.getElementById('compare-status');
-const summaryEl = document.getElementById('summary');
-const resultsEl = document.getElementById('results');
+const duplicatesStatusEl = document.getElementById('duplicates-status');
+const compareSummaryEl = document.getElementById('compare-summary');
+const duplicatesSummaryEl = document.getElementById('duplicates-summary');
+const compareResultsEl = document.getElementById('compare-results');
+const duplicatesResultsEl = document.getElementById('duplicates-results');
 const statusEl = document.getElementById('app-status');
 const collapseMissingFoldersStorageKey = 'sympath.collapseMissingFolders';
 
+let activeTab = 'compare';
 let roots = [];
 const dirsCache = {};
+
 let hasComparisonResult = false;
 let isCompareDirty = false;
 let isComparing = false;
 let lastComparisonData = null;
 let lastComparisonIsByContent = false;
 
+let hasDuplicateResult = false;
+let isDuplicatesDirty = false;
+let isFindingDuplicates = false;
 collapseMissingFoldersBox.checked = loadCollapseMissingFoldersPreference();
 updateCollapseMissingFoldersState();
+
+function initTabs() {
+  compareTabButton.addEventListener('click', () => activateTab('compare'));
+  duplicatesTabButton.addEventListener('click', () => activateTab('duplicates'));
+  activateTab('compare');
+}
+
+function activateTab(tabName) {
+  activeTab = tabName;
+  const compareActive = tabName === 'compare';
+
+  compareTabButton.classList.toggle('active', compareActive);
+  compareTabButton.setAttribute('aria-selected', compareActive ? 'true' : 'false');
+  comparePanel.hidden = !compareActive;
+
+  duplicatesTabButton.classList.toggle('active', !compareActive);
+  duplicatesTabButton.setAttribute('aria-selected', compareActive ? 'false' : 'true');
+  duplicatesPanel.hidden = compareActive;
+}
 
 async function init() {
   initStatus();
@@ -173,7 +267,9 @@ async function init() {
     const resp = await fetch('/api/roots');
     roots = await resp.json();
   } catch (e) {
-    resultsEl.textContent = 'Failed to load roots: ' + e.message;
+    const message = 'Failed to load roots: ' + e.message;
+    compareResultsEl.textContent = message;
+    duplicatesResultsEl.textContent = message;
     return;
   }
   const placeholder = '<option value="">Select a root...</option>';
@@ -182,7 +278,9 @@ async function init() {
   ).join('');
   leftRootSel.innerHTML = placeholder + opts;
   rightRootSel.innerHTML = placeholder + opts;
+  duplicatesRootSel.innerHTML = placeholder + opts;
   updateCompareActionState();
+  updateDuplicatesActionState();
 }
 
 async function initStatus() {
@@ -242,14 +340,39 @@ function getCompareParams() {
   return params;
 }
 
+function getDuplicatesParams() {
+  const idx = duplicatesRootSel.value;
+  if (idx === '') return null;
+
+  const root = roots[parseInt(idx)];
+  if (!root) return null;
+
+  const params = new URLSearchParams({
+    machine_id: root.machine_id,
+    root: root.root,
+  });
+  const prefix = normalizePrefix(duplicatesAc.input.value);
+  if (prefix) params.set('prefix', prefix);
+  if (duplicatesIgnoreCommonOSBox.checked) params.set('ignore_common_os', '1');
+  return params;
+}
+
 function clearCompareResults(message) {
   hasComparisonResult = false;
   lastComparisonData = null;
   lastComparisonIsByContent = false;
-  summaryEl.style.display = 'none';
-  summaryEl.classList.remove('stale');
-  resultsEl.className = 'results empty';
-  resultsEl.textContent = message;
+  compareSummaryEl.style.display = 'none';
+  compareSummaryEl.classList.remove('stale');
+  compareResultsEl.className = 'results empty';
+  compareResultsEl.textContent = message;
+}
+
+function clearDuplicatesResults(message) {
+  hasDuplicateResult = false;
+  duplicatesSummaryEl.style.display = 'none';
+  duplicatesSummaryEl.classList.remove('stale');
+  duplicatesResultsEl.className = 'results empty';
+  duplicatesResultsEl.textContent = message;
 }
 
 function updateCompareActionState() {
@@ -260,7 +383,7 @@ function updateCompareActionState() {
   compareButton.textContent = isComparing ? 'Comparing...' : 'Compare';
   compareButton.classList.toggle('pending', ready && isCompareDirty && !isComparing);
   compareStatusEl.className = 'compare-status';
-  summaryEl.classList.toggle('stale', isCompareDirty && hasComparisonResult);
+  compareSummaryEl.classList.toggle('stale', isCompareDirty && hasComparisonResult);
 
   if (isComparing) {
     compareStatusEl.textContent = isCompareDirty
@@ -285,6 +408,39 @@ function updateCompareActionState() {
     : 'Ready to compare.';
 }
 
+function updateDuplicatesActionState() {
+  const params = getDuplicatesParams();
+  const ready = params !== null;
+
+  duplicatesButton.disabled = !ready || isFindingDuplicates;
+  duplicatesButton.textContent = isFindingDuplicates ? 'Finding duplicates...' : 'Find duplicates';
+  duplicatesButton.classList.toggle('pending', ready && isDuplicatesDirty && !isFindingDuplicates);
+  duplicatesStatusEl.className = 'compare-status';
+  duplicatesSummaryEl.classList.toggle('stale', isDuplicatesDirty && hasDuplicateResult);
+
+  if (isFindingDuplicates) {
+    duplicatesStatusEl.textContent = isDuplicatesDirty
+      ? 'Selections changed. Find duplicates will re-enable when this run finishes.'
+      : 'Duplicate search running. Large roots can take a while.';
+    duplicatesStatusEl.classList.add('busy');
+    return;
+  }
+  if (!ready) {
+    duplicatesStatusEl.textContent = 'Select a root to search for duplicates.';
+    return;
+  }
+  if (isDuplicatesDirty) {
+    duplicatesStatusEl.textContent = hasDuplicateResult
+      ? 'Selections changed. Click Find duplicates to refresh the results.'
+      : 'Ready to search.';
+    duplicatesStatusEl.classList.add('stale');
+    return;
+  }
+  duplicatesStatusEl.textContent = hasDuplicateResult
+    ? 'Results are up to date.'
+    : 'Ready to search.';
+}
+
 function markCompareDirty() {
   const ready = getCompareParams() !== null;
   isCompareDirty = ready;
@@ -292,11 +448,25 @@ function markCompareDirty() {
   if (!ready) {
     clearCompareResults('Select a root on each side to compare.');
   } else if (!hasComparisonResult && !isComparing) {
-    resultsEl.className = 'results empty';
-    resultsEl.textContent = 'Click Compare to run this query.';
+    compareResultsEl.className = 'results empty';
+    compareResultsEl.textContent = 'Click Compare to run this query.';
   }
 
   updateCompareActionState();
+}
+
+function markDuplicatesDirty() {
+  const ready = getDuplicatesParams() !== null;
+  isDuplicatesDirty = ready;
+
+  if (!ready) {
+    clearDuplicatesResults('Select a root to search for duplicates.');
+  } else if (!hasDuplicateResult && !isFindingDuplicates) {
+    duplicatesResultsEl.className = 'results empty';
+    duplicatesResultsEl.textContent = 'Click Find duplicates to run this query.';
+  }
+
+  updateDuplicatesActionState();
 }
 
 function loadCollapseMissingFoldersPreference() {
@@ -334,15 +504,13 @@ async function fetchDirs(rootIdx) {
   } catch (e) { return []; }
 }
 
-// --- Autocomplete component ---
-
-function createAutocomplete(rootSel, inputId, ghostId, listId) {
+function createAutocomplete(rootSel, inputId, ghostId, listId, onDirty) {
   const input = document.getElementById(inputId);
   const ghost = document.getElementById(ghostId);
   const list = document.getElementById(listId);
   let dirs = [];
   let matches = [];
-  let activeIdx = -1; // -1 = none highlighted, input value is authoritative
+  let activeIdx = -1;
 
   rootSel.addEventListener('change', async () => {
     input.value = '';
@@ -362,11 +530,11 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
         input.placeholder = 'type to filter, Tab to complete';
       }
     }
-    markCompareDirty();
+    onDirty();
   });
 
   function getMatches(v) {
-    if (!v) return dirs.slice(0, 50); // show top dirs when focused with empty input
+    if (!v) return dirs.slice(0, 50);
     const vl = v.toLowerCase();
     return dirs.filter(d => d.toLowerCase().startsWith(vl));
   }
@@ -379,10 +547,8 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
     return m[0];
   }
 
-  // Tab-complete: longest common prefix snapped to next / boundary.
   function tabComplete(v) {
     if (!v) {
-      // If nothing typed but there's a ghost, complete to first segment.
       if (matches.length > 0) {
         const first = matches[0];
         const slash = first.indexOf('/');
@@ -394,7 +560,6 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
     const m = dirs.filter(d => d.toLowerCase().startsWith(vl));
     if (m.length === 0) return null;
 
-    // LCP of all matches.
     let lcp = m[0];
     for (let i = 1; i < m.length; i++) {
       let j = 0;
@@ -419,7 +584,6 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
     for (let i = 0; i < matches.length; i++) {
       const d = matches[i];
       const cls = i === activeIdx ? 'ac-item active' : 'ac-item';
-      // Bold the matched prefix.
       const matchPart = esc(d.substring(0, vLen));
       const rest = esc(d.substring(vLen));
       html += `<div class="${cls}" data-idx="${i}"><span class="match">${matchPart}</span>${rest}</div>`;
@@ -427,7 +591,6 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
     list.innerHTML = html;
     list.classList.add('open');
 
-    // Scroll active into view.
     if (activeIdx >= 0) {
       const el = list.children[activeIdx];
       if (el) el.scrollIntoView({ block: 'nearest' });
@@ -445,7 +608,7 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
     input.value = v;
     ghost.textContent = '';
     closeList();
-    markCompareDirty();
+    onDirty();
   }
 
   function updateGhost() {
@@ -468,18 +631,16 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
     activeIdx = -1;
     renderList();
     updateGhost();
-    markCompareDirty();
+    onDirty();
   });
 
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Tab') {
       e.preventDefault();
-      // If an item is highlighted, accept it.
       if (activeIdx >= 0 && matches[activeIdx]) {
         acceptValue(matches[activeIdx] + '/');
         return;
       }
-      // Otherwise tab-complete.
       const completed = tabComplete(input.value);
       if (completed !== null && completed !== input.value) {
         input.value = completed;
@@ -487,7 +648,7 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
         activeIdx = -1;
         renderList();
         updateGhost();
-        markCompareDirty();
+        onDirty();
       }
     } else if (e.key === 'ArrowDown') {
       e.preventDefault();
@@ -517,13 +678,12 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
         input.value = '';
         ghost.textContent = '';
         closeList();
-        markCompareDirty();
+        onDirty();
       }
     }
   });
 
   input.addEventListener('blur', () => {
-    // Delay so click on list item registers.
     setTimeout(() => {
       closeList();
       ghost.textContent = getCompletion(input.value);
@@ -531,7 +691,6 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
   });
 
   list.addEventListener('mousedown', (e) => {
-    // Prevent blur from firing before click.
     e.preventDefault();
   });
 
@@ -548,8 +707,9 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
   return { input, dirs: () => dirs };
 }
 
-const leftAc = createAutocomplete(leftRootSel, 'left-dir', 'left-ghost', 'left-list');
-const rightAc = createAutocomplete(rightRootSel, 'right-dir', 'right-ghost', 'right-list');
+const leftAc = createAutocomplete(leftRootSel, 'left-dir', 'left-ghost', 'left-list', markCompareDirty);
+const rightAc = createAutocomplete(rightRootSel, 'right-dir', 'right-ghost', 'right-list', markCompareDirty);
+const duplicatesAc = createAutocomplete(duplicatesRootSel, 'duplicates-dir', 'duplicates-ghost', 'duplicates-list', markDuplicatesDirty);
 
 byContentBox.addEventListener('change', () => {
   updateCollapseMissingFoldersState();
@@ -557,12 +717,12 @@ byContentBox.addEventListener('change', () => {
 });
 collapseMissingFoldersBox.addEventListener('change', () => {
   persistCollapseMissingFoldersPreference();
-  if (lastComparisonData) render(lastComparisonData);
+  if (lastComparisonData) renderCompare(lastComparisonData);
 });
 ignoreCommonOSBox.addEventListener('change', markCompareDirty);
+duplicatesIgnoreCommonOSBox.addEventListener('change', markDuplicatesDirty);
 compareButton.addEventListener('click', compare);
-
-// --- Compare logic ---
+duplicatesButton.addEventListener('click', findDuplicates);
 
 async function compare() {
   const params = getCompareParams();
@@ -581,15 +741,15 @@ async function compare() {
   lastComparisonData = null;
   lastComparisonIsByContent = false;
   updateCompareActionState();
-  resultsEl.className = 'results empty';
-  resultsEl.textContent = 'Comparing...';
-  summaryEl.style.display = 'none';
-  summaryEl.classList.remove('stale');
+  compareResultsEl.className = 'results empty';
+  compareResultsEl.textContent = 'Comparing...';
+  compareSummaryEl.style.display = 'none';
+  compareSummaryEl.classList.remove('stale');
 
   try {
     const resp = await fetch('/api/compare?' + requestKey);
     if (!resp.ok) {
-      resultsEl.textContent = 'Error: ' + await resp.text();
+      compareResultsEl.textContent = 'Error: ' + await resp.text();
       return;
     }
     const data = await resp.json();
@@ -602,16 +762,58 @@ async function compare() {
     hasComparisonResult = true;
     lastComparisonData = data;
     lastComparisonIsByContent = requestByContent;
-    render(data);
+    renderCompare(data);
   } catch (e) {
-    resultsEl.textContent = 'Request failed: ' + e.message;
+    compareResultsEl.textContent = 'Request failed: ' + e.message;
   } finally {
     isComparing = false;
     updateCompareActionState();
   }
 }
 
-function render(data) {
+async function findDuplicates() {
+  const params = getDuplicatesParams();
+  if (!params) {
+    isDuplicatesDirty = false;
+    clearDuplicatesResults('Select a root to search for duplicates.');
+    updateDuplicatesActionState();
+    return;
+  }
+
+  const requestKey = params.toString();
+  isFindingDuplicates = true;
+  isDuplicatesDirty = false;
+  hasDuplicateResult = false;
+  updateDuplicatesActionState();
+  duplicatesResultsEl.className = 'results empty';
+  duplicatesResultsEl.textContent = 'Finding duplicates...';
+  duplicatesSummaryEl.style.display = 'none';
+  duplicatesSummaryEl.classList.remove('stale');
+
+  try {
+    const resp = await fetch('/api/duplicates?' + requestKey);
+    if (!resp.ok) {
+      duplicatesResultsEl.textContent = 'Error: ' + await resp.text();
+      return;
+    }
+    const data = await resp.json();
+    const currentParams = getDuplicatesParams();
+    if (!currentParams || currentParams.toString() !== requestKey) {
+      isDuplicatesDirty = currentParams !== null;
+      clearDuplicatesResults('Selections changed while duplicate search was running. Click Find duplicates to refresh.');
+      return;
+    }
+    hasDuplicateResult = true;
+    renderDuplicates(data);
+  } catch (e) {
+    duplicatesResultsEl.textContent = 'Request failed: ' + e.message;
+  } finally {
+    isFindingDuplicates = false;
+    updateDuplicatesActionState();
+  }
+}
+
+function renderCompare(data) {
   const leftOnlyRows = useCompactMissingFolders()
     ? (data.left_only_compact || data.left_only)
     : data.left_only;
@@ -620,16 +822,16 @@ function render(data) {
     : data.right_only;
   const total = data.identical_count + data.left_only.length + data.right_only.length + data.different.length;
 
-  summaryEl.textContent = `${data.identical_count.toLocaleString()} identical files out of ${total.toLocaleString()} total`;
-  summaryEl.style.display = 'block';
+  compareSummaryEl.textContent = `${data.identical_count.toLocaleString()} identical files out of ${total.toLocaleString()} total`;
+  compareSummaryEl.style.display = 'block';
 
   if (data.left_only.length === 0 && data.right_only.length === 0 && data.different.length === 0) {
-    resultsEl.className = 'results empty';
-    resultsEl.textContent = 'All files are identical.';
+    compareResultsEl.className = 'results empty';
+    compareResultsEl.textContent = 'All files are identical.';
     return;
   }
 
-  resultsEl.className = 'results';
+  compareResultsEl.className = 'results';
   let html = '<table>';
   html += '<tr><th>Left path</th><th class="size">Left size</th><th>Left SHA-256</th>';
   html += '<th>Right path</th><th class="size">Right size</th><th>Right SHA-256</th></tr>';
@@ -675,7 +877,35 @@ function render(data) {
   }
 
   html += '</table>';
-  resultsEl.innerHTML = html;
+  compareResultsEl.innerHTML = html;
+}
+
+function renderDuplicates(data) {
+  const groups = data.groups || [];
+  const fileCount = groups.reduce((count, group) => count + group.files.length, 0);
+
+  duplicatesSummaryEl.textContent = `${groups.length.toLocaleString()} duplicate groups containing ${fileCount.toLocaleString()} files`;
+  duplicatesSummaryEl.style.display = 'block';
+
+  if (groups.length === 0) {
+    duplicatesResultsEl.className = 'results empty';
+    duplicatesResultsEl.textContent = 'No duplicate files found.';
+    return;
+  }
+
+  duplicatesResultsEl.className = 'results';
+  let html = '<table>';
+  html += '<tr><th>Path</th></tr>';
+
+  for (const group of groups) {
+    html += `<tr class="duplicate-group"><td><div class="group-meta"><span>${fmtFileCount(group.files.length)}</span><span>${fmtSize(group.size)}</span><span class="group-hash">SHA-256 ${shortSha(group.sha256)}</span></div></td></tr>`;
+    for (const file of group.files) {
+      html += `<tr class="duplicate-file"><td>${esc(file.rel_path)}</td></tr>`;
+    }
+  }
+
+  html += '</table>';
+  duplicatesResultsEl.innerHTML = html;
 }
 
 function useCompactMissingFolders() {
@@ -739,6 +969,7 @@ function shortSha(s) {
   return s.substring(0, 12) + '...';
 }
 
+initTabs();
 init();
 </script>
 </body>

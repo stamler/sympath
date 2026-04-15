@@ -122,6 +122,7 @@ func runUIWithIO(args []string, stdout, stderr io.Writer) error {
 	mux.HandleFunc("/api/roots", srv.handleRoots)
 	mux.HandleFunc("/api/dirs", srv.handleDirs)
 	mux.HandleFunc("/api/compare", srv.handleCompare)
+	mux.HandleFunc("/api/duplicates", srv.handleDuplicates)
 
 	staticSub, err := fs.Sub(uiStaticFS, "ui_static")
 	if err != nil {

@@ -27,6 +27,20 @@ type compareResult struct {
 	Different        []fileDiffPair     `json:"different"`
 }
 
+type duplicatesResult struct {
+	Groups []duplicateGroup `json:"groups"`
+}
+
+type duplicateGroup struct {
+	Size   int64           `json:"size"`
+	SHA256 string          `json:"sha256"`
+	Files  []duplicateFile `json:"files"`
+}
+
+type duplicateFile struct {
+	RelPath string `json:"rel_path"`
+}
+
 type fileEntry struct {
 	RelPath string `json:"rel_path"`
 	Size    int64  `json:"size"`
@@ -105,6 +119,11 @@ func entryCTEs(leftScan, rightScan int64, leftPrefix, rightPrefix string, ignore
 		%s`, leftCTE, rightCTE), append(leftArgs, rightArgs...)
 }
 
+func singleEntryCTE(name string, scanID int64, prefix string, ignoreCommonOS bool) (string, []any) {
+	cte, args := filteredEntriesCTE(name, scanID, normalizePrefix(prefix), true, ignoreCommonOS)
+	return "WITH " + cte, args
+}
+
 func filteredEntriesCTE(name string, scanID int64, prefix string, joinOnRawPath, ignoreCommonOS bool) (string, []any) {
 	ignoreClause, ignoreArgs := ignoredCommonOSClause(ignoreCommonOS)
 
@@ -164,6 +183,63 @@ func compareRoots(ctx context.Context, db *sql.DB, leftMachine, leftRoot, rightM
 		return compareByContent(ctx, db, leftScan, rightScan, leftPrefix, rightPrefix, ignoreCommonOS)
 	}
 	return compareByPath(ctx, db, leftScan, rightScan, leftPrefix, rightPrefix, ignoreCommonOS)
+}
+
+func findDuplicates(ctx context.Context, db *sql.DB, machineID, root, prefix string, ignoreCommonOS bool) (duplicatesResult, error) {
+	scanID, err := resolveScanID(ctx, db, machineID, root)
+	if err != nil {
+		return duplicatesResult{}, fmt.Errorf("resolve scan: %w", err)
+	}
+
+	cte, args := singleEntryCTE("target_entries", scanID, prefix, ignoreCommonOS)
+	rows, err := db.QueryContext(ctx, cte+`
+		, duplicate_keys AS (
+			SELECT size, sha256
+			FROM target_entries
+			WHERE NULLIF(sha256, '') IS NOT NULL
+			GROUP BY size, sha256
+			HAVING COUNT(*) >= 2
+		)
+		SELECT t.rel_path, t.size, COALESCE(t.sha256, '')
+		FROM target_entries t
+		JOIN duplicate_keys d
+		  ON d.size = t.size
+		 AND d.sha256 = t.sha256
+		ORDER BY t.size DESC, t.sha256 ASC, t.rel_path ASC
+	`, args...)
+	if err != nil {
+		return duplicatesResult{}, fmt.Errorf("query duplicates: %w", err)
+	}
+	defer rows.Close()
+
+	var result duplicatesResult
+	groupIndex := -1
+	var lastSize int64
+	var lastSHA string
+	for rows.Next() {
+		var relPath string
+		var size int64
+		var sha string
+		if err := rows.Scan(&relPath, &size, &sha); err != nil {
+			return duplicatesResult{}, err
+		}
+		if groupIndex == -1 || size != lastSize || sha != lastSHA {
+			result.Groups = append(result.Groups, duplicateGroup{
+				Size:   size,
+				SHA256: sha,
+				Files:  []duplicateFile{},
+			})
+			groupIndex = len(result.Groups) - 1
+			lastSize = size
+			lastSHA = sha
+		}
+		result.Groups[groupIndex].Files = append(result.Groups[groupIndex].Files, duplicateFile{RelPath: relPath})
+	}
+	if err := rows.Err(); err != nil {
+		return duplicatesResult{}, err
+	}
+
+	return ensureNonNilDuplicateGroups(result), nil
 }
 
 func compareByPath(ctx context.Context, db *sql.DB, leftScan, rightScan int64, leftPrefix, rightPrefix string, ignoreCommonOS bool) (compareResult, error) {
@@ -575,6 +651,13 @@ func ensureNonNilSlices(r compareResult) compareResult {
 	}
 	if r.Different == nil {
 		r.Different = []fileDiffPair{}
+	}
+	return r
+}
+
+func ensureNonNilDuplicateGroups(r duplicatesResult) duplicatesResult {
+	if r.Groups == nil {
+		r.Groups = []duplicateGroup{}
 	}
 	return r
 }
