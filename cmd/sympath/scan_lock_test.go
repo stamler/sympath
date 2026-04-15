@@ -80,6 +80,13 @@ func TestScanLockHelperProcess(t *testing.T) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(3)
 	}
+	if mode == "startup-lock" {
+		fmt.Fprintln(os.Stdout, "ready")
+		_ = os.Stdout.Sync()
+		_, _ = io.ReadAll(os.Stdin)
+		_ = startupLock.Close()
+		os.Exit(0)
+	}
 	if mode == "active-scan" {
 		dbGuard, err = acquireScanDBGuardLockShared(context.Background(), stateDir)
 		if err != nil {
@@ -209,6 +216,11 @@ func TestAcquireScanDBGuardLockShared_AllowsConcurrentHolders(t *testing.T) {
 func startActiveScanHelper(t *testing.T, stateDir, machineID, root string) (*exec.Cmd, io.WriteCloser) {
 	t.Helper()
 	return startScanLockHelper(t, stateDir, machineID, root, "active-scan")
+}
+
+func startStartupLockHelper(t *testing.T, stateDir string) (*exec.Cmd, io.WriteCloser) {
+	t.Helper()
+	return startScanLockHelper(t, stateDir, "", "", "startup-lock")
 }
 
 func startScanLockHelper(t *testing.T, stateDir, machineID, root, mode string) (*exec.Cmd, io.WriteCloser) {

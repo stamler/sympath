@@ -46,6 +46,8 @@ func (localOnlyTransport) FetchRemoteDB(context.Context, string, string, string)
 // selection and open.
 var openUIReadOnlyDBForRunUI = openUIReadOnlyDB
 
+const uiStartupWaitWarning = "Waiting for another sympath process to finish startup or scanning work before opening the UI snapshot. Press Ctrl-C to cancel."
+
 func runUIWithIO(args []string, stdout, stderr io.Writer) error {
 	if len(args) > 0 {
 		return errors.New("ui accepts no arguments")
@@ -56,18 +58,43 @@ func runUIWithIO(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("resolve sympath state directory: %w", err)
 	}
 
-	startupLock, err := acquireScanStartupLock(context.Background(), dir)
+	logger := newUILogger(stderr)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	warnedAboutWait := false
+	warnAboutWait := func() {
+		if warnedAboutWait {
+			return
+		}
+		logger.Warnf(uiStartupWaitWarning)
+		warnedAboutWait = true
+	}
+
+	startupLock, startupLockOK, err := tryAcquireScanStartupLock(dir)
 	if err != nil {
 		return fmt.Errorf("acquire scan startup lock: %w", err)
 	}
+	if !startupLockOK {
+		warnAboutWait()
+		startupLock, err = acquireScanStartupLock(ctx, dir)
+		if err != nil {
+			return fmt.Errorf("acquire scan startup lock: %w", err)
+		}
+	}
 	defer startupLock.Close()
-	dbGuard, err := acquireScanDBGuardLockExclusive(context.Background(), dir)
+	dbGuard, dbGuardOK, err := tryAcquireScanDBGuardLockExclusive(dir)
 	if err != nil {
 		return fmt.Errorf("acquire exclusive database guard: %w", err)
 	}
+	if !dbGuardOK {
+		warnAboutWait()
+		dbGuard, err = acquireScanDBGuardLockExclusive(ctx, dir)
+		if err != nil {
+			return fmt.Errorf("acquire exclusive database guard: %w", err)
+		}
+	}
 	defer dbGuard.Close()
-
-	logger := newUILogger(stderr)
 	logger.Debugf("Preparing UI startup")
 
 	if err := ensureSympathDir(dir, logger); err != nil {

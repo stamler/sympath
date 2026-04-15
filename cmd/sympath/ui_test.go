@@ -345,9 +345,10 @@ func TestRunUIWithIO_WaitsForActiveScanToReleaseDBGuard(t *testing.T) {
 		_ = helperCmd.Wait()
 	}()
 
+	var stderr bytes.Buffer
 	resultCh := make(chan error, 1)
 	go func() {
-		resultCh <- runUIWithIO(nil, io.Discard, io.Discard)
+		resultCh <- runUIWithIO(nil, io.Discard, &stderr)
 	}()
 
 	select {
@@ -371,8 +372,60 @@ func TestRunUIWithIO_WaitsForActiveScanToReleaseDBGuard(t *testing.T) {
 		if !strings.Contains(err.Error(), "run `sympath scan [ROOT]` first") {
 			t.Fatalf("expected friendly scan-first error after release, got %v", err)
 		}
+		if !strings.Contains(stderr.String(), uiStartupWaitWarning) {
+			t.Fatalf("expected UI wait warning in logs, got:\n%s", stderr.String())
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected UI startup to finish after active scan released")
+	}
+}
+
+func TestRunUIWithIO_WaitsForStartupLockToRelease(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	stateDir, err := sympathStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	helperCmd, helperStdin := startStartupLockHelper(t, stateDir)
+	defer func() {
+		_ = helperStdin.Close()
+		_ = helperCmd.Wait()
+	}()
+
+	var stderr bytes.Buffer
+	resultCh := make(chan error, 1)
+	go func() {
+		resultCh <- runUIWithIO(nil, io.Discard, &stderr)
+	}()
+
+	select {
+	case err := <-resultCh:
+		t.Fatalf("expected UI startup to wait for startup lock, returned early with %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	if err := helperStdin.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := helperCmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-resultCh:
+		if err == nil {
+			t.Fatal("expected missing-inventory error after startup lock released")
+		}
+		if !strings.Contains(err.Error(), "run `sympath scan [ROOT]` first") {
+			t.Fatalf("expected friendly scan-first error after startup lock release, got %v", err)
+		}
+		if !strings.Contains(stderr.String(), uiStartupWaitWarning) {
+			t.Fatalf("expected UI wait warning in logs, got:\n%s", stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected UI startup to finish after startup lock released")
 	}
 }
 

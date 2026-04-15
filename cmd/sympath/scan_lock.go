@@ -86,6 +86,14 @@ func acquireScanStartupLock(ctx context.Context, stateDir string) (*fileLock, er
 	return acquireBlockingFileLock(ctx, filepath.Join(locksDir, scanStartupLockName), fileLockModeExclusive)
 }
 
+func tryAcquireScanStartupLock(stateDir string) (*fileLock, bool, error) {
+	locksDir, err := ensureScanLocksDir(stateDir)
+	if err != nil {
+		return nil, false, err
+	}
+	return tryAcquireFileLock(filepath.Join(locksDir, scanStartupLockName), fileLockModeExclusive)
+}
+
 func acquireScanDBGuardLockShared(ctx context.Context, stateDir string) (*fileLock, error) {
 	locksDir, err := ensureScanLocksDir(stateDir)
 	if err != nil {
