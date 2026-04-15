@@ -75,6 +75,9 @@ td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; font-
 .diff td { background: #fff8f8; }
 .diff .changed { color: #c62828; font-weight: 600; }
 
+.collapsed-path { color: #555; font-style: italic; }
+.collapsed-note { color: #777; font-style: normal; }
+
 .size { text-align: right; white-space: nowrap; }
 .sha { color: #666; max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
 
@@ -126,6 +129,7 @@ td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; font-
 
 <div class="options">
   <label><input type="checkbox" id="by-content"> Match by content (ignore path)</label>
+  <label><input type="checkbox" id="collapse-missing-folders" checked> Collapse fully missing folders</label>
   <label><input type="checkbox" id="ignore-common-os" checked> Ignore common OS metadata files</label>
   <div class="compare-controls">
     <span class="compare-status" id="compare-status">Select a root on each side to compare.</span>
@@ -143,18 +147,25 @@ td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; font-
 const leftRootSel = document.getElementById('left-root');
 const rightRootSel = document.getElementById('right-root');
 const byContentBox = document.getElementById('by-content');
+const collapseMissingFoldersBox = document.getElementById('collapse-missing-folders');
 const ignoreCommonOSBox = document.getElementById('ignore-common-os');
 const compareButton = document.getElementById('compare-button');
 const compareStatusEl = document.getElementById('compare-status');
 const summaryEl = document.getElementById('summary');
 const resultsEl = document.getElementById('results');
 const statusEl = document.getElementById('app-status');
+const collapseMissingFoldersStorageKey = 'sympath.collapseMissingFolders';
 
 let roots = [];
 const dirsCache = {};
 let hasComparisonResult = false;
 let isCompareDirty = false;
 let isComparing = false;
+let lastComparisonData = null;
+let lastComparisonIsByContent = false;
+
+collapseMissingFoldersBox.checked = loadCollapseMissingFoldersPreference();
+updateCollapseMissingFoldersState();
 
 async function init() {
   initStatus();
@@ -233,6 +244,8 @@ function getCompareParams() {
 
 function clearCompareResults(message) {
   hasComparisonResult = false;
+  lastComparisonData = null;
+  lastComparisonIsByContent = false;
   summaryEl.style.display = 'none';
   summaryEl.classList.remove('stale');
   resultsEl.className = 'results empty';
@@ -284,6 +297,26 @@ function markCompareDirty() {
   }
 
   updateCompareActionState();
+}
+
+function loadCollapseMissingFoldersPreference() {
+  try {
+    const stored = localStorage.getItem(collapseMissingFoldersStorageKey);
+    if (stored === null) return true;
+    return stored !== '0';
+  } catch (e) {
+    return true;
+  }
+}
+
+function persistCollapseMissingFoldersPreference() {
+  try {
+    localStorage.setItem(collapseMissingFoldersStorageKey, collapseMissingFoldersBox.checked ? '1' : '0');
+  } catch (e) {}
+}
+
+function updateCollapseMissingFoldersState() {
+  collapseMissingFoldersBox.disabled = byContentBox.checked;
 }
 
 async function fetchDirs(rootIdx) {
@@ -518,7 +551,14 @@ function createAutocomplete(rootSel, inputId, ghostId, listId) {
 const leftAc = createAutocomplete(leftRootSel, 'left-dir', 'left-ghost', 'left-list');
 const rightAc = createAutocomplete(rightRootSel, 'right-dir', 'right-ghost', 'right-list');
 
-byContentBox.addEventListener('change', markCompareDirty);
+byContentBox.addEventListener('change', () => {
+  updateCollapseMissingFoldersState();
+  markCompareDirty();
+});
+collapseMissingFoldersBox.addEventListener('change', () => {
+  persistCollapseMissingFoldersPreference();
+  if (lastComparisonData) render(lastComparisonData);
+});
 ignoreCommonOSBox.addEventListener('change', markCompareDirty);
 compareButton.addEventListener('click', compare);
 
@@ -534,9 +574,12 @@ async function compare() {
   }
 
   const requestKey = params.toString();
+  const requestByContent = params.get('by_content') === '1';
   isComparing = true;
   isCompareDirty = false;
   hasComparisonResult = false;
+  lastComparisonData = null;
+  lastComparisonIsByContent = false;
   updateCompareActionState();
   resultsEl.className = 'results empty';
   resultsEl.textContent = 'Comparing...';
@@ -557,6 +600,8 @@ async function compare() {
       return;
     }
     hasComparisonResult = true;
+    lastComparisonData = data;
+    lastComparisonIsByContent = requestByContent;
     render(data);
   } catch (e) {
     resultsEl.textContent = 'Request failed: ' + e.message;
@@ -567,6 +612,12 @@ async function compare() {
 }
 
 function render(data) {
+  const leftOnlyRows = useCompactMissingFolders()
+    ? (data.left_only_compact || data.left_only)
+    : data.left_only;
+  const rightOnlyRows = useCompactMissingFolders()
+    ? (data.right_only_compact || data.right_only)
+    : data.right_only;
   const total = data.identical_count + data.left_only.length + data.right_only.length + data.different.length;
 
   summaryEl.textContent = `${data.identical_count.toLocaleString()} identical files out of ${total.toLocaleString()} total`;
@@ -600,31 +651,57 @@ function render(data) {
   }
 
   if (data.left_only.length > 0) {
-    html += `<tr><td colspan="6" class="section-heading">Left only (${data.left_only.length})</td></tr>`;
-    for (const f of data.left_only) {
+    html += `<tr><td colspan="6" class="section-heading">${formatOnlyHeading('Left only', data.left_only.length, leftOnlyRows.length)}</td></tr>`;
+    for (const f of leftOnlyRows) {
       html += `<tr class="left-only">`;
-      html += `<td class="left">${esc(f.rel_path)}</td>`;
-      html += `<td class="left size">${fmtSize(f.size)}</td>`;
-      html += `<td class="left sha">${shortSha(f.sha256)}</td>`;
+      html += `<td class="left">${renderOnlyPath(f)}</td>`;
+      html += `<td class="left size">${renderOnlySize(f)}</td>`;
+      html += `<td class="left sha">${renderOnlySHA(f)}</td>`;
       html += `<td class="right"></td><td class="right"></td><td class="right"></td>`;
       html += `</tr>`;
     }
   }
 
   if (data.right_only.length > 0) {
-    html += `<tr><td colspan="6" class="section-heading">Right only (${data.right_only.length})</td></tr>`;
-    for (const f of data.right_only) {
+    html += `<tr><td colspan="6" class="section-heading">${formatOnlyHeading('Right only', data.right_only.length, rightOnlyRows.length)}</td></tr>`;
+    for (const f of rightOnlyRows) {
       html += `<tr class="right-only">`;
       html += `<td class="left"></td><td class="left"></td><td class="left"></td>`;
-      html += `<td class="right">${esc(f.rel_path)}</td>`;
-      html += `<td class="right size">${fmtSize(f.size)}</td>`;
-      html += `<td class="right sha">${shortSha(f.sha256)}</td>`;
+      html += `<td class="right">${renderOnlyPath(f)}</td>`;
+      html += `<td class="right size">${renderOnlySize(f)}</td>`;
+      html += `<td class="right sha">${renderOnlySHA(f)}</td>`;
       html += `</tr>`;
     }
   }
 
   html += '</table>';
   resultsEl.innerHTML = html;
+}
+
+function useCompactMissingFolders() {
+  return collapseMissingFoldersBox.checked && !lastComparisonIsByContent;
+}
+
+function renderOnlyPath(entry) {
+  if (entry.collapsed) {
+    return `<span class="collapsed-path">${esc(entry.rel_path)}</span> <span class="collapsed-note">(${fmtFileCount(entry.file_count)})</span>`;
+  }
+  return esc(entry.rel_path);
+}
+
+function renderOnlySize(entry) {
+  return entry.collapsed ? '' : fmtSize(entry.size);
+}
+
+function renderOnlySHA(entry) {
+  return entry.collapsed ? '' : shortSha(entry.sha256);
+}
+
+function formatOnlyHeading(label, fileCount, rowCount) {
+  if (rowCount !== fileCount) {
+    return `${label} (${fmtFileCount(fileCount)}, ${fmtRowCount(rowCount)} shown)`;
+  }
+  return `${label} (${fileCount})`;
 }
 
 function esc(s) {
@@ -647,6 +724,14 @@ function fmtSize(bytes) {
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
   if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
   return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+}
+
+function fmtFileCount(count) {
+  return count === 1 ? '1 file' : `${count.toLocaleString()} files`;
+}
+
+function fmtRowCount(count) {
+  return count === 1 ? '1 row' : `${count.toLocaleString()} rows`;
 }
 
 function shortSha(s) {

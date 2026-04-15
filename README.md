@@ -96,6 +96,12 @@ Interactive scans show a live progress line on `stderr` with a spinner,
 a bouncing shaded block track, and running file counts while the inventory is
 being built.
 
+`sympath ui` launches a local compare interface for two inventoried roots. It
+can compare by path or by content, optionally ignore common OS metadata files,
+and, in path mode, collapses fully missing folder trees into compact rows like
+`path/to/folder/* (N files)` by default. That compact view can be toggled off
+in the UI.
+
 ## Remotes
 
 The installer does not create or populate `~/.sympath/remotes`. Remote aggregation stays manual.

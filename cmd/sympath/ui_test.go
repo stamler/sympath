@@ -167,6 +167,23 @@ func compareHasEntry(entries []fileEntry, relPath string) bool {
 	return false
 }
 
+func compareHasDisplayEntry(entries []fileDisplayEntry, relPath string) bool {
+	for _, entry := range entries {
+		if entry.RelPath == relPath {
+			return true
+		}
+	}
+	return false
+}
+
+func blockedDirSet(dirs ...string) map[string]struct{} {
+	blocked := make(map[string]struct{}, len(dirs))
+	for _, dir := range dirs {
+		blocked[dir] = struct{}{}
+	}
+	return blocked
+}
+
 func compareHasDiff(diffs []fileDiffPair, relPath string) bool {
 	for _, diff := range diffs {
 		if diff.RelPath == relPath {
@@ -596,11 +613,29 @@ func TestEmbeddedUIIncludesStatusMountAndExplicitCompareAction(t *testing.T) {
 	if !strings.Contains(html, "id=\"ignore-common-os\" checked") {
 		t.Fatalf("expected checked common OS ignore toggle in embedded UI, got:\n%s", html)
 	}
+	if !strings.Contains(html, "id=\"collapse-missing-folders\" checked") {
+		t.Fatalf("expected checked collapse missing folders toggle in embedded UI, got:\n%s", html)
+	}
 	if !strings.Contains(html, "compareButton.addEventListener('click', compare)") {
 		t.Fatalf("expected compare button click handler in embedded UI, got:\n%s", html)
 	}
 	if !strings.Contains(html, "ignoreCommonOSBox.addEventListener('change', markCompareDirty)") {
 		t.Fatalf("expected common OS ignore toggle to dirty compare state, got:\n%s", html)
+	}
+	if !strings.Contains(html, "localStorage.getItem(collapseMissingFoldersStorageKey)") {
+		t.Fatalf("expected collapse missing folders toggle to load persisted state, got:\n%s", html)
+	}
+	if !strings.Contains(html, "localStorage.setItem(collapseMissingFoldersStorageKey") {
+		t.Fatalf("expected collapse missing folders toggle to persist state, got:\n%s", html)
+	}
+	if !strings.Contains(html, "collapseMissingFoldersBox.disabled = byContentBox.checked") {
+		t.Fatalf("expected collapse missing folders toggle to disable in content mode, got:\n%s", html)
+	}
+	if !strings.Contains(html, "formatOnlyHeading('Left only'") {
+		t.Fatalf("expected compact headings to describe shown rows, got:\n%s", html)
+	}
+	if !strings.Contains(html, "class=\"collapsed-path\"") {
+		t.Fatalf("expected collapsed rows to include a visual affordance, got:\n%s", html)
 	}
 	if !strings.Contains(html, "params.set('ignore_common_os', '1')") {
 		t.Fatalf("expected compare requests to include ignore_common_os flag, got:\n%s", html)
@@ -732,6 +767,12 @@ func TestHandleCompare(t *testing.T) {
 	if d.Left.Size != 300 || d.Right.Size != 500 {
 		t.Fatalf("expected sizes 300/500, got %d/%d", d.Left.Size, d.Right.Size)
 	}
+	if len(result.LeftOnlyCompact) != len(result.LeftOnly) {
+		t.Fatalf("expected left-only compact rows to match baseline row count, got %d vs %d", len(result.LeftOnlyCompact), len(result.LeftOnly))
+	}
+	if len(result.RightOnlyCompact) != len(result.RightOnly) {
+		t.Fatalf("expected right-only compact rows to match baseline row count, got %d vs %d", len(result.RightOnlyCompact), len(result.RightOnly))
+	}
 }
 
 func TestHandleCompareWithPrefix(t *testing.T) {
@@ -773,6 +814,12 @@ func TestHandleCompareWithPrefix(t *testing.T) {
 	// no different files in sub/
 	if len(result.Different) != 0 {
 		t.Fatalf("expected 0 different in sub/, got %d", len(result.Different))
+	}
+	if len(result.LeftOnlyCompact) != 1 || result.LeftOnlyCompact[0].RelPath != "only-a.txt" {
+		t.Fatalf("expected only-a.txt as the compact left-only result in sub/, got %v", result.LeftOnlyCompact)
+	}
+	if len(result.RightOnlyCompact) != 1 || result.RightOnlyCompact[0].RelPath != "only-b.txt" {
+		t.Fatalf("expected only-b.txt as the compact right-only result in sub/, got %v", result.RightOnlyCompact)
 	}
 }
 
@@ -967,6 +1014,9 @@ func TestHandleCompareByContent(t *testing.T) {
 	if len(result.Different) != 0 {
 		t.Fatalf("expected 0 different in content mode, got %d", len(result.Different))
 	}
+	if len(result.LeftOnlyCompact) != 0 || len(result.RightOnlyCompact) != 0 {
+		t.Fatalf("expected no compact-only rows in content mode, got left=%v right=%v", result.LeftOnlyCompact, result.RightOnlyCompact)
+	}
 }
 
 func TestHandleCompareIncludesMissingHashesAsDifferent(t *testing.T) {
@@ -1042,6 +1092,9 @@ func TestHandleCompareByContentWithPrefix(t *testing.T) {
 	}
 	if len(result.LeftOnly) != 1 {
 		t.Fatalf("expected 1 left-only by content with prefix, got %d: %v", len(result.LeftOnly), result.LeftOnly)
+	}
+	if len(result.LeftOnlyCompact) != 0 || len(result.RightOnlyCompact) != 0 {
+		t.Fatalf("expected no compact rows in content mode with prefix, got left=%v right=%v", result.LeftOnlyCompact, result.RightOnlyCompact)
 	}
 }
 
@@ -1201,6 +1254,170 @@ func TestHandleCompareIgnoreCommonOSFiltersPrefixResults(t *testing.T) {
 	}
 	if len(result.Different) != 0 {
 		t.Fatalf("expected no different results in sub/ after ignoring metadata, got %v", result.Different)
+	}
+}
+
+func TestCompactMissingTreesFullyMissingSubtreeCollapsesTopmostDirectory(t *testing.T) {
+	entries := []fileEntry{
+		{RelPath: "missing/a.txt", Size: 10, SHA256: "a"},
+		{RelPath: "missing/deeper/b.txt", Size: 20, SHA256: "b"},
+	}
+
+	got := compactMissingTrees(entries, countMissingTreeDirs(entries), nil)
+	want := []fileDisplayEntry{
+		{RelPath: "missing/*", FileCount: 2, Collapsed: true},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected compact rows:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+func TestCompactMissingTreesPartiallySharedAncestorKeepsDeeperExclusiveBranch(t *testing.T) {
+	entries := []fileEntry{
+		{RelPath: "shared/only/a.txt", Size: 10, SHA256: "a"},
+		{RelPath: "shared/only/b.txt", Size: 20, SHA256: "b"},
+	}
+
+	got := compactMissingTrees(entries, countMissingTreeDirs(entries), blockedDirSet("shared"))
+	want := []fileDisplayEntry{
+		{RelPath: "shared/only/*", FileCount: 2, Collapsed: true},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected compact rows:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+func TestCompactMissingTreesRecursiveBranchesCollapseSeparately(t *testing.T) {
+	entries := []fileEntry{
+		{RelPath: "shared/alpha/a.txt", Size: 10, SHA256: "a"},
+		{RelPath: "shared/alpha/b.txt", Size: 20, SHA256: "b"},
+		{RelPath: "shared/beta/c.txt", Size: 30, SHA256: "c"},
+		{RelPath: "shared/beta/d.txt", Size: 40, SHA256: "d"},
+	}
+
+	got := compactMissingTrees(entries, countMissingTreeDirs(entries), blockedDirSet("shared"))
+	want := []fileDisplayEntry{
+		{RelPath: "shared/alpha/*", FileCount: 2, Collapsed: true},
+		{RelPath: "shared/beta/*", FileCount: 2, Collapsed: true},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected compact rows:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+func TestCompactMissingTreesSingleFileFolderStaysExpanded(t *testing.T) {
+	entries := []fileEntry{
+		{RelPath: "single/only.txt", Size: 10, SHA256: "a"},
+	}
+
+	got := compactMissingTrees(entries, countMissingTreeDirs(entries), nil)
+	want := []fileDisplayEntry{
+		{RelPath: "single/only.txt", Size: 10, SHA256: "a"},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected compact rows:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+func TestCompactMissingTreesPrefixStrippedPathsCollapseCorrectly(t *testing.T) {
+	entries := []fileEntry{
+		{RelPath: "gone/a.txt", Size: 10, SHA256: "a"},
+		{RelPath: "gone/deeper/b.txt", Size: 20, SHA256: "b"},
+		{RelPath: "keep/solo.txt", Size: 30, SHA256: "c"},
+	}
+
+	got := compactMissingTrees(entries, countMissingTreeDirs(entries), blockedDirSet("keep"))
+	want := []fileDisplayEntry{
+		{RelPath: "gone/*", FileCount: 2, Collapsed: true},
+		{RelPath: "keep/solo.txt", Size: 30, SHA256: "c"},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected compact rows:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+func TestHandleCompareIncludesCompactMissingTrees(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	leftScan := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	insertUITestEntry(t, db, leftScan, "missing/a.txt", 101, "missing-a")
+	insertUITestEntry(t, db, leftScan, "missing/deeper/b.txt", 202, "missing-b")
+	insertUITestEntry(t, db, leftScan, "single/only.txt", 303, "single-only")
+
+	req := httptest.NewRequest("GET", "/api/compare?left_machine=machine-a&left_root=/data/photos&right_machine=machine-b&right_root=/data/photos", nil)
+	rec := httptest.NewRecorder()
+	srv.handleCompare(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result compareResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(result.LeftOnly) != 5 {
+		t.Fatalf("expected raw left-only results to remain expanded, got %d: %v", len(result.LeftOnly), result.LeftOnly)
+	}
+	if !compareHasEntry(result.LeftOnly, "missing/a.txt") || !compareHasEntry(result.LeftOnly, "missing/deeper/b.txt") {
+		t.Fatalf("expected raw left-only entries to keep missing subtree files, got %v", result.LeftOnly)
+	}
+	if !compareHasDisplayEntry(result.LeftOnlyCompact, "missing/*") {
+		t.Fatalf("expected compact left-only entries to collapse missing subtree, got %v", result.LeftOnlyCompact)
+	}
+	if !compareHasDisplayEntry(result.LeftOnlyCompact, "single/only.txt") {
+		t.Fatalf("expected single-file folder to stay expanded in compact view, got %v", result.LeftOnlyCompact)
+	}
+	if compareHasDisplayEntry(result.LeftOnlyCompact, "single/*") {
+		t.Fatalf("expected single-file folder not to collapse, got %v", result.LeftOnlyCompact)
+	}
+	if len(result.LeftOnlyCompact) != 4 {
+		t.Fatalf("expected compact left-only results to reduce one subtree, got %d: %v", len(result.LeftOnlyCompact), result.LeftOnlyCompact)
+	}
+}
+
+func TestHandleCompareDoesNotCollapseFileDirectoryConflict(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	leftScan := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	rightScan := resolveUITestScanID(t, db, "machine-b", "/data/photos")
+
+	insertUITestEntry(t, db, leftScan, "conflict/one.txt", 101, "conflict-one")
+	insertUITestEntry(t, db, leftScan, "conflict/two.txt", 202, "conflict-two")
+	insertUITestEntry(t, db, rightScan, "conflict", 303, "conflict-file")
+
+	req := httptest.NewRequest("GET", "/api/compare?left_machine=machine-a&left_root=/data/photos&right_machine=machine-b&right_root=/data/photos", nil)
+	rec := httptest.NewRecorder()
+	srv.handleCompare(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result compareResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if !compareHasEntry(result.LeftOnly, "conflict/one.txt") || !compareHasEntry(result.LeftOnly, "conflict/two.txt") {
+		t.Fatalf("expected raw left-only entries for file-directory conflict, got %v", result.LeftOnly)
+	}
+	if !compareHasEntry(result.RightOnly, "conflict") {
+		t.Fatalf("expected conflicting file to remain right-only, got %v", result.RightOnly)
+	}
+	if compareHasDisplayEntry(result.LeftOnlyCompact, "conflict/*") {
+		t.Fatalf("expected file-directory conflict not to collapse as missing folder, got %v", result.LeftOnlyCompact)
+	}
+	if !compareHasDisplayEntry(result.LeftOnlyCompact, "conflict/one.txt") || !compareHasDisplayEntry(result.LeftOnlyCompact, "conflict/two.txt") {
+		t.Fatalf("expected conflicting subtree files to stay expanded in compact view, got %v", result.LeftOnlyCompact)
 	}
 }
 

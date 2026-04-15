@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path"
+	"sort"
 	"strings"
 	"unicode/utf8"
 )
@@ -17,16 +19,26 @@ var ignoredCommonOSBasenames = []string{
 }
 
 type compareResult struct {
-	IdenticalCount int            `json:"identical_count"`
-	LeftOnly       []fileEntry    `json:"left_only"`
-	RightOnly      []fileEntry    `json:"right_only"`
-	Different      []fileDiffPair `json:"different"`
+	IdenticalCount   int                `json:"identical_count"`
+	LeftOnly         []fileEntry        `json:"left_only"`
+	LeftOnlyCompact  []fileDisplayEntry `json:"left_only_compact"`
+	RightOnly        []fileEntry        `json:"right_only"`
+	RightOnlyCompact []fileDisplayEntry `json:"right_only_compact"`
+	Different        []fileDiffPair     `json:"different"`
 }
 
 type fileEntry struct {
 	RelPath string `json:"rel_path"`
 	Size    int64  `json:"size"`
 	SHA256  string `json:"sha256"`
+}
+
+type fileDisplayEntry struct {
+	RelPath   string `json:"rel_path"`
+	Size      int64  `json:"size"`
+	SHA256    string `json:"sha256"`
+	FileCount int    `json:"file_count,omitempty"`
+	Collapsed bool   `json:"collapsed,omitempty"`
 }
 
 type fileDiffPair struct {
@@ -180,6 +192,15 @@ func compareByPath(ctx context.Context, db *sql.DB, leftScan, rightScan int64, l
 	result.RightOnly, err = queryOnlyFilesCTE(ctx, db, cte, args, "right_entries", "left_entries")
 	if err != nil {
 		return compareResult{}, fmt.Errorf("query right-only: %w", err)
+	}
+
+	result.LeftOnlyCompact, err = compactMissingTreesCTE(ctx, db, cte, args, result.LeftOnly, "right_entries")
+	if err != nil {
+		return compareResult{}, fmt.Errorf("compact left-only: %w", err)
+	}
+	result.RightOnlyCompact, err = compactMissingTreesCTE(ctx, db, cte, args, result.RightOnly, "left_entries")
+	if err != nil {
+		return compareResult{}, fmt.Errorf("compact right-only: %w", err)
 	}
 
 	// Different files.
@@ -375,12 +396,182 @@ func queryOnlyFilesCTE(ctx context.Context, db *sql.DB, cte string, args []any, 
 	return entries, rows.Err()
 }
 
+func compactMissingTreesCTE(ctx context.Context, db *sql.DB, cte string, args []any, entries []fileEntry, oppositeTable string) ([]fileDisplayEntry, error) {
+	if len(entries) == 0 {
+		return []fileDisplayEntry{}, nil
+	}
+
+	subtreeCounts := countMissingTreeDirs(entries)
+	candidateDirs := collapseCandidateDirs(subtreeCounts)
+	if len(candidateDirs) == 0 {
+		return rawDisplayEntries(entries), nil
+	}
+
+	blockedDirs, err := queryBlockedDirsCTE(ctx, db, cte, args, oppositeTable, candidateDirs)
+	if err != nil {
+		return nil, err
+	}
+
+	return compactMissingTrees(entries, subtreeCounts, blockedDirs), nil
+}
+
+func queryBlockedDirsCTE(ctx context.Context, db *sql.DB, cte string, args []any, table string, candidateDirs []string) (map[string]struct{}, error) {
+	blockedDirs := make(map[string]struct{})
+	if len(candidateDirs) == 0 {
+		return blockedDirs, nil
+	}
+
+	const candidateDirBatchSize = 400
+
+	for start := 0; start < len(candidateDirs); start += candidateDirBatchSize {
+		end := start + candidateDirBatchSize
+		if end > len(candidateDirs) {
+			end = len(candidateDirs)
+		}
+
+		batch := candidateDirs[start:end]
+		values := make([]string, 0, len(batch))
+		queryArgs := append([]any{}, args...)
+		for _, dir := range batch {
+			values = append(values, "(?)")
+			queryArgs = append(queryArgs, dir)
+		}
+
+		query := fmt.Sprintf(cte+`,
+			candidate_dirs(dir) AS (
+				VALUES %s
+			)
+			SELECT DISTINCT c.dir
+			FROM candidate_dirs c
+			JOIN %s o
+			  ON o.rel_path = c.dir
+			  OR (
+				o.rel_path >= c.dir || '/'
+				AND o.rel_path < c.dir || '/' || x'FF'
+			  )
+		`, strings.Join(values, ", "), table)
+
+		rows, err := db.QueryContext(ctx, query, queryArgs...)
+		if err != nil {
+			return nil, err
+		}
+
+		for rows.Next() {
+			var dir string
+			if err := rows.Scan(&dir); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			blockedDirs[dir] = struct{}{}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+
+	return blockedDirs, nil
+}
+
+func compactMissingTrees(entries []fileEntry, subtreeCounts map[string]int, blockedDirs map[string]struct{}) []fileDisplayEntry {
+	if len(entries) == 0 {
+		return []fileDisplayEntry{}
+	}
+
+	compact := make([]fileDisplayEntry, 0, len(entries))
+	emittedDirs := make(map[string]struct{})
+	for _, entry := range entries {
+		if dir := topmostCollapsibleDir(entry.RelPath, subtreeCounts, blockedDirs); dir != "" {
+			if _, ok := emittedDirs[dir]; !ok {
+				compact = append(compact, fileDisplayEntry{
+					RelPath:   dir + "/*",
+					FileCount: subtreeCounts[dir],
+					Collapsed: true,
+				})
+				emittedDirs[dir] = struct{}{}
+			}
+			continue
+		}
+
+		compact = append(compact, fileDisplayEntry{
+			RelPath: entry.RelPath,
+			Size:    entry.Size,
+			SHA256:  entry.SHA256,
+		})
+	}
+
+	return compact
+}
+
+func countMissingTreeDirs(entries []fileEntry) map[string]int {
+	subtreeCounts := make(map[string]int)
+	for _, entry := range entries {
+		for _, dir := range ancestorDirs(entry.RelPath) {
+			subtreeCounts[dir]++
+		}
+	}
+	return subtreeCounts
+}
+
+func collapseCandidateDirs(subtreeCounts map[string]int) []string {
+	candidateDirs := make([]string, 0, len(subtreeCounts))
+	for dir, count := range subtreeCounts {
+		if count >= 2 {
+			candidateDirs = append(candidateDirs, dir)
+		}
+	}
+	sort.Strings(candidateDirs)
+	return candidateDirs
+}
+
+func rawDisplayEntries(entries []fileEntry) []fileDisplayEntry {
+	display := make([]fileDisplayEntry, 0, len(entries))
+	for _, entry := range entries {
+		display = append(display, fileDisplayEntry{
+			RelPath: entry.RelPath,
+			Size:    entry.Size,
+			SHA256:  entry.SHA256,
+		})
+	}
+	return display
+}
+
+func topmostCollapsibleDir(relPath string, subtreeCounts map[string]int, blockedDirs map[string]struct{}) string {
+	dirs := ancestorDirs(relPath)
+	for i := len(dirs) - 1; i >= 0; i-- {
+		dir := dirs[i]
+		if subtreeCounts[dir] < 2 {
+			continue
+		}
+		if _, blocked := blockedDirs[dir]; blocked {
+			continue
+		}
+		return dir
+	}
+	return ""
+}
+
+func ancestorDirs(relPath string) []string {
+	var dirs []string
+	for dir := path.Dir(relPath); dir != "." && dir != ""; dir = path.Dir(dir) {
+		dirs = append(dirs, dir)
+	}
+	return dirs
+}
+
 func ensureNonNilSlices(r compareResult) compareResult {
 	if r.LeftOnly == nil {
 		r.LeftOnly = []fileEntry{}
 	}
+	if r.LeftOnlyCompact == nil {
+		r.LeftOnlyCompact = []fileDisplayEntry{}
+	}
 	if r.RightOnly == nil {
 		r.RightOnly = []fileEntry{}
+	}
+	if r.RightOnlyCompact == nil {
+		r.RightOnlyCompact = []fileDisplayEntry{}
 	}
 	if r.Different == nil {
 		r.Different = []fileDiffPair{}
