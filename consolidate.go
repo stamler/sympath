@@ -12,6 +12,7 @@ package inventory
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"sort"
 )
 
@@ -42,6 +43,12 @@ type currentScanRecord struct {
 // for that same key is removed before the incoming scan and entries are
 // inserted. This makes repeated consolidation runs safe and idempotent.
 func ImportCurrentScans(ctx context.Context, target, source *sql.DB) (ImportSummary, error) {
+	sourceEntryColumns, err := tableColumns(ctx, source, "entries")
+	if err != nil {
+		return ImportSummary{}, err
+	}
+	sourceHasRelPathNorm := sourceEntryColumns["rel_path_norm"] != ""
+
 	rows, err := source.QueryContext(ctx, `
 		SELECT
 			s.scan_id,
@@ -91,7 +98,7 @@ func ImportCurrentScans(ctx context.Context, target, source *sql.DB) (ImportSumm
 	}
 
 	for _, rec := range records {
-		if err := importCurrentScan(ctx, target, source, rec); err != nil {
+		if err := importCurrentScan(ctx, target, source, rec, sourceHasRelPathNorm); err != nil {
 			return ImportSummary{}, err
 		}
 	}
@@ -147,7 +154,7 @@ func DeleteMachineData(ctx context.Context, db *sql.DB, machineIDs []string) err
 	return nil
 }
 
-func importCurrentScan(ctx context.Context, target, source *sql.DB, rec currentScanRecord) error {
+func importCurrentScan(ctx context.Context, target, source *sql.DB, rec currentScanRecord, sourceHasRelPathNorm bool) error {
 	tx, err := target.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -200,12 +207,16 @@ func importCurrentScan(ctx context.Context, target, source *sql.DB, rec currentS
 		return err
 	}
 
-	entryRows, err := source.QueryContext(ctx, `
-		SELECT rel_path, name, ext, size, mtime_ns, fingerprint, sha256, state, err
+	relPathNormExpr := "NULL AS rel_path_norm"
+	if sourceHasRelPathNorm {
+		relPathNormExpr = "rel_path_norm"
+	}
+	entryRows, err := source.QueryContext(ctx, fmt.Sprintf(`
+		SELECT rel_path, %s, name, ext, size, mtime_ns, fingerprint, sha256, state, err
 		FROM entries
 		WHERE scan_id = ?
 		ORDER BY rel_path
-	`, rec.ScanID)
+	`, relPathNormExpr), rec.ScanID)
 	if err != nil {
 		return err
 	}
@@ -213,8 +224,8 @@ func importCurrentScan(ctx context.Context, target, source *sql.DB, rec currentS
 
 	insertEntryStmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO entries (
-			scan_id, rel_path, name, ext, size, mtime_ns, fingerprint, sha256, state, err
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			scan_id, rel_path, rel_path_norm, name, ext, size, mtime_ns, fingerprint, sha256, state, err
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -224,9 +235,10 @@ func importCurrentScan(ctx context.Context, target, source *sql.DB, rec currentS
 	for entryRows.Next() {
 		var relPath, name, ext string
 		var size, mtimeNS int64
-		var fingerprint, sha256, state, errText sql.NullString
+		var relPathNorm, fingerprint, sha256, state, errText sql.NullString
 		if err := entryRows.Scan(
 			&relPath,
+			&relPathNorm,
 			&name,
 			&ext,
 			&size,
@@ -238,10 +250,16 @@ func importCurrentScan(ctx context.Context, target, source *sql.DB, rec currentS
 		); err != nil {
 			return err
 		}
+		if (!relPathNorm.Valid || relPathNorm.String == "") && relPath != "" {
+			if normalized, ok := storedRelPathNorm(relPath); ok {
+				relPathNorm = sql.NullString{String: normalized, Valid: true}
+			}
+		}
 		if _, err := insertEntryStmt.ExecContext(
 			ctx,
 			newScanID,
 			relPath,
+			nullStringValue(relPathNorm),
 			name,
 			ext,
 			size,

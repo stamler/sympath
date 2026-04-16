@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -150,10 +151,14 @@ func insertUITestEntry(t *testing.T, db *sql.DB, scanID int64, relPath string, s
 
 	name := path.Base(relPath)
 	ext := path.Ext(name)
+	var relPathNorm any
+	if normalized := inventory.CompareRelPathKey(relPath); normalized != relPath {
+		relPathNorm = normalized
+	}
 	if _, err := db.ExecContext(context.Background(), `
-		INSERT INTO entries (scan_id, rel_path, name, ext, size, mtime_ns, sha256, state)
-		VALUES (?, ?, ?, ?, ?, 0, ?, 'ok')
-	`, scanID, relPath, name, ext, size, sha256); err != nil {
+		INSERT INTO entries (scan_id, rel_path, rel_path_norm, name, ext, size, mtime_ns, sha256, state)
+		VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'ok')
+	`, scanID, relPath, relPathNorm, name, ext, size, sha256); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -993,6 +998,145 @@ func TestHandleCompareWithUnicodePrefixes(t *testing.T) {
 	}
 }
 
+func TestHandleCompareMatchesUnicodeNormalizationDifferences(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	leftScan := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	rightScan := resolveUITestScanID(t, db, "machine-b", "/data/photos")
+
+	leftPrefix := "albums/La Vie de re\u0302ve"
+	rightPrefix := "albums/La Vie de rêve"
+	leftPath := leftPrefix + "/shared.flac"
+	rightPath := rightPrefix + "/shared.flac"
+	insertUITestEntry(t, db, leftScan, leftPath, 111, "shared-hash")
+	insertUITestEntry(t, db, rightScan, rightPath, 111, "shared-hash")
+
+	req := httptest.NewRequest("GET", "/api/compare?left_machine=machine-a&left_root=/data/photos&right_machine=machine-b&right_root=/data/photos&left_prefix="+url.QueryEscape(leftPrefix)+"&right_prefix="+url.QueryEscape(rightPrefix), nil)
+	rec := httptest.NewRecorder()
+	srv.handleCompare(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result compareResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if result.IdenticalCount != 1 {
+		t.Fatalf("expected 1 identical normalized-path match, got %d", result.IdenticalCount)
+	}
+	if len(result.LeftOnly) != 0 || len(result.RightOnly) != 0 || len(result.Different) != 0 {
+		t.Fatalf("expected no leftovers for normalized identical paths, got left=%v right=%v diff=%v", result.LeftOnly, result.RightOnly, result.Different)
+	}
+}
+
+func TestHandleCompareReportsDifferentForUnicodeNormalizationDifferences(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	leftScan := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	rightScan := resolveUITestScanID(t, db, "machine-b", "/data/photos")
+
+	leftPrefix := "albums/La Vie de re\u0302ve"
+	rightPrefix := "albums/La Vie de rêve"
+	insertUITestEntry(t, db, leftScan, leftPrefix+"/different.flac", 111, "left-hash")
+	insertUITestEntry(t, db, rightScan, rightPrefix+"/different.flac", 222, "right-hash")
+
+	req := httptest.NewRequest("GET", "/api/compare?left_machine=machine-a&left_root=/data/photos&right_machine=machine-b&right_root=/data/photos&left_prefix="+url.QueryEscape(leftPrefix)+"&right_prefix="+url.QueryEscape(rightPrefix), nil)
+	rec := httptest.NewRecorder()
+	srv.handleCompare(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result compareResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(result.Different) != 1 {
+		t.Fatalf("expected one normalized-path diff, got %v", result.Different)
+	}
+	if result.Different[0].RelPath != "different.flac" {
+		t.Fatalf("expected prefix-stripped compare path in diff row, got %q", result.Different[0].RelPath)
+	}
+	if len(result.LeftOnly) != 0 || len(result.RightOnly) != 0 {
+		t.Fatalf("expected normalized-path diff to avoid unmatched rows, got left=%v right=%v", result.LeftOnly, result.RightOnly)
+	}
+}
+
+func TestHandleCompareWithUnicodeNormalizationDifferencesInPrefixes(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	leftScan := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	rightScan := resolveUITestScanID(t, db, "machine-b", "/data/photos")
+
+	leftPrefix := "La Vie de re\u0302ve"
+	rightPrefix := "La Vie de rêve"
+	insertUITestEntry(t, db, leftScan, leftPrefix+"/shared.txt", 111, "shared-hash")
+	insertUITestEntry(t, db, rightScan, rightPrefix+"/shared.txt", 111, "shared-hash")
+
+	req := httptest.NewRequest("GET", "/api/compare?left_machine=machine-a&left_root=/data/photos&right_machine=machine-b&right_root=/data/photos&left_prefix="+url.QueryEscape(leftPrefix)+"&right_prefix="+url.QueryEscape(rightPrefix), nil)
+	rec := httptest.NewRecorder()
+	srv.handleCompare(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result compareResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if result.IdenticalCount != 1 || len(result.LeftOnly) != 0 || len(result.RightOnly) != 0 || len(result.Different) != 0 {
+		t.Fatalf("expected prefix-stripped normalized identical match, got %#v", result)
+	}
+}
+
+func TestHandleCompareKeepsAmbiguousUnicodeNormalizationCollisionsUnmatched(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	leftScan := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	rightScan := resolveUITestScanID(t, db, "machine-b", "/data/photos")
+
+	prefix := "collision"
+	decomposed := "conflict/re\u0302ve.txt"
+	composed := "conflict/rêve.txt"
+	insertUITestEntry(t, db, leftScan, prefix+"/"+decomposed, 101, "left-decomposed")
+	insertUITestEntry(t, db, leftScan, prefix+"/"+composed, 202, "shared-composed")
+	insertUITestEntry(t, db, rightScan, prefix+"/"+composed, 202, "shared-composed")
+
+	req := httptest.NewRequest("GET", "/api/compare?left_machine=machine-a&left_root=/data/photos&right_machine=machine-b&right_root=/data/photos&left_prefix="+url.QueryEscape(prefix)+"&right_prefix="+url.QueryEscape(prefix), nil)
+	rec := httptest.NewRecorder()
+	srv.handleCompare(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result compareResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if result.IdenticalCount != 1 {
+		t.Fatalf("expected the exact raw-path match to win, got %#v", result)
+	}
+	if !compareHasEntry(result.LeftOnly, decomposed) {
+		t.Fatalf("expected decomposed collision path to remain unmatched, got %#v", result.LeftOnly)
+	}
+	if len(result.RightOnly) != 0 || len(result.Different) != 0 {
+		t.Fatalf("expected no extra normalized collision matches, got right=%v diff=%v", result.RightOnly, result.Different)
+	}
+}
+
 func TestHandleCompareWithLiteralGlobPrefix(t *testing.T) {
 	db := setupUITestDB(t)
 	srv := &uiServer{db: db}
@@ -1640,6 +1784,80 @@ func TestHandleCompareIncludesCompactMissingTrees(t *testing.T) {
 	}
 	if len(result.LeftOnlyCompact) != 4 {
 		t.Fatalf("expected compact left-only results to reduce one subtree, got %d: %v", len(result.LeftOnlyCompact), result.LeftOnlyCompact)
+	}
+}
+
+func TestHandleCompareDoesNotCollapseDirWithMatchedAndMissingFiles(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	leftScan := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	rightScan := resolveUITestScanID(t, db, "machine-b", "/data/photos")
+
+	insertUITestEntry(t, db, leftScan, "mixed/shared.txt", 111, "mixed-shared")
+	insertUITestEntry(t, db, rightScan, "mixed/shared.txt", 111, "mixed-shared")
+	insertUITestEntry(t, db, leftScan, "mixed/only-left-a.txt", 222, "mixed-left-a")
+	insertUITestEntry(t, db, leftScan, "mixed/sub/only-left-b.txt", 333, "mixed-left-b")
+
+	req := httptest.NewRequest("GET", "/api/compare?left_machine=machine-a&left_root=/data/photos&right_machine=machine-b&right_root=/data/photos", nil)
+	rec := httptest.NewRecorder()
+	srv.handleCompare(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result compareResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if !compareHasEntry(result.LeftOnly, "mixed/only-left-a.txt") || !compareHasEntry(result.LeftOnly, "mixed/sub/only-left-b.txt") {
+		t.Fatalf("expected raw left-only entries for partially matched directory, got %v", result.LeftOnly)
+	}
+	if compareHasDisplayEntry(result.LeftOnlyCompact, "mixed/*") {
+		t.Fatalf("expected partially matched directory not to collapse, got %v", result.LeftOnlyCompact)
+	}
+	if !compareHasDisplayEntry(result.LeftOnlyCompact, "mixed/only-left-a.txt") || !compareHasDisplayEntry(result.LeftOnlyCompact, "mixed/sub/only-left-b.txt") {
+		t.Fatalf("expected partially matched directory entries to stay expanded in compact view, got %v", result.LeftOnlyCompact)
+	}
+}
+
+func TestHandleCompareDoesNotCollapseNormalizedMatchedDir(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	leftScan := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	rightScan := resolveUITestScanID(t, db, "machine-b", "/data/photos")
+
+	leftDir := "re\u0302ve"
+	rightDir := "rêve"
+	insertUITestEntry(t, db, leftScan, leftDir+"/shared.txt", 111, "norm-shared")
+	insertUITestEntry(t, db, rightScan, rightDir+"/shared.txt", 111, "norm-shared")
+	insertUITestEntry(t, db, leftScan, leftDir+"/only-left-a.txt", 222, "norm-left-a")
+	insertUITestEntry(t, db, leftScan, leftDir+"/sub/only-left-b.txt", 333, "norm-left-b")
+
+	req := httptest.NewRequest("GET", "/api/compare?left_machine=machine-a&left_root=/data/photos&right_machine=machine-b&right_root=/data/photos", nil)
+	rec := httptest.NewRecorder()
+	srv.handleCompare(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result compareResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if !compareHasEntry(result.LeftOnly, leftDir+"/only-left-a.txt") || !compareHasEntry(result.LeftOnly, leftDir+"/sub/only-left-b.txt") {
+		t.Fatalf("expected raw left-only entries for normalized-match directory, got %v", result.LeftOnly)
+	}
+	if compareHasDisplayEntry(result.LeftOnlyCompact, leftDir+"/*") {
+		t.Fatalf("expected normalization-aware matched directory not to collapse, got %v", result.LeftOnlyCompact)
+	}
+	if !compareHasDisplayEntry(result.LeftOnlyCompact, leftDir+"/only-left-a.txt") || !compareHasDisplayEntry(result.LeftOnlyCompact, leftDir+"/sub/only-left-b.txt") {
+		t.Fatalf("expected normalization-aware matched directory entries to stay expanded in compact view, got %v", result.LeftOnlyCompact)
 	}
 }
 

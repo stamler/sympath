@@ -114,6 +114,7 @@ func runWalker(
 			return nil
 		}
 		rel = filepath.ToSlash(rel)
+		relPathNorm, _ := storedRelPathNorm(rel)
 
 		name := filepath.Base(rel)
 		ext := strings.ToLower(filepath.Ext(name))
@@ -128,6 +129,7 @@ func runWalker(
 		if ok {
 			entry := baseEntry{
 				RelPath:     rel,
+				RelPathNorm: relPathNorm,
 				Name:        name,
 				Ext:         ext,
 				Size:        size,
@@ -143,12 +145,13 @@ func runWalker(
 
 		// File needs hashing
 		entry := baseEntry{
-			RelPath: rel,
-			Name:    name,
-			Ext:     ext,
-			Size:    size,
-			MtimeNS: mtimeNS,
-			State:   "pending",
+			RelPath:     rel,
+			RelPathNorm: relPathNorm,
+			Name:        name,
+			Ext:         ext,
+			Size:        size,
+			MtimeNS:     mtimeNS,
+			State:       "pending",
 		}
 		entryCh <- entry
 		progress.noteDiscovered(entry.State)

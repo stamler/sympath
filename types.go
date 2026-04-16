@@ -63,6 +63,7 @@ type HashResult struct {
 // previous scan. If the State is "error", ErrMsg describes the problem.
 type baseEntry struct {
 	RelPath     string
+	RelPathNorm string
 	Name        string
 	Ext         string
 	Size        int64

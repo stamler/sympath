@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS scans (
 CREATE TABLE IF NOT EXISTS entries (
     scan_id INTEGER NOT NULL,
     rel_path TEXT NOT NULL,
+    rel_path_norm TEXT,
     name TEXT NOT NULL,
     ext TEXT NOT NULL,
     size INTEGER NOT NULL,
@@ -104,8 +105,33 @@ func EnsureSchema(ctx context.Context, db *sql.DB, identity MachineIdentity) err
 	if err := migrateLegacySchema(ctx, db, identity); err != nil {
 		return err
 	}
-	_, err := db.ExecContext(ctx, createTablesSQL)
-	return err
+	if _, err := db.ExecContext(ctx, createTablesSQL); err != nil {
+		return err
+	}
+	if err := ensureEntriesColumns(ctx, db); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureEntriesColumns(ctx context.Context, db *sql.DB) error {
+	hasEntries, err := tableExists(ctx, db, "entries")
+	if err != nil {
+		return err
+	}
+	if !hasEntries {
+		return nil
+	}
+	entryColumns, err := tableColumns(ctx, db, "entries")
+	if err != nil {
+		return err
+	}
+	if entryColumns["rel_path_norm"] == "" {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE entries ADD COLUMN rel_path_norm TEXT"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ConfigureConnection sets SQLite pragmas for performance and correctness.

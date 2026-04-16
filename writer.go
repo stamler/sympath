@@ -36,8 +36,8 @@ const batchSize = 5000
 // insertSQL is the prepared statement template for inserting a base
 // entry row into the entries table.
 const insertSQL = `
-	INSERT INTO entries (scan_id, rel_path, name, ext, size, mtime_ns, fingerprint, sha256, state, err)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	INSERT INTO entries (scan_id, rel_path, rel_path_norm, name, ext, size, mtime_ns, fingerprint, sha256, state, err)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `
 
 // updateSQL is the prepared statement template for updating an entry's
@@ -123,8 +123,12 @@ func runWriter(
 		if entry.SHA256 != "" {
 			hash = &entry.SHA256
 		}
+		var relPathNorm *string
+		if entry.RelPathNorm != "" {
+			relPathNorm = &entry.RelPathNorm
+		}
 		if _, err := insertStmt.ExecContext(ctx,
-			scanID, entry.RelPath, entry.Name, entry.Ext,
+			scanID, entry.RelPath, relPathNorm, entry.Name, entry.Ext,
 			entry.Size, entry.MtimeNS, fp, hash, entry.State, errStr,
 		); err != nil {
 			return err

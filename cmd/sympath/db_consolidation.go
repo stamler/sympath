@@ -264,6 +264,9 @@ func consolidateSympathDir(
 	if err := inventory.PrepareLocalMachineDB(ctx, targetDB, identity); err != nil {
 		return "", fmt.Errorf("prepare consolidation database %q: %w", targetPath, err)
 	}
+	if err := inventory.EnsureRelPathNormBackfill(ctx, targetDB); err != nil {
+		return "", fmt.Errorf("prepare normalization data for consolidation database %q: %w", targetPath, err)
+	}
 
 	logger.Debugf("Consolidating %d local database file(s) and %d fetched remote file(s) in %s", len(localDBs), len(fetched), dir)
 	mergeProgress := newItemProgressDisplay(logger, "Merging")

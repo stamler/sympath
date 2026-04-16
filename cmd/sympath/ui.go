@@ -16,6 +16,8 @@ import (
 	"runtime"
 	"syscall"
 
+	inventory "sympath"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -111,6 +113,25 @@ func runUIWithIO(args []string, stdout, stderr io.Writer) error {
 	}
 	if err := requireExistingUIDatabase(dbPath); err != nil {
 		return err
+	}
+	// consolidateSympathDir short-circuits and returns a single local DB unmerged
+	// when there's nothing to consolidate, skipping its own backfill — open the
+	// chosen DB read/write to ensure schema and rel_path_norm are populated
+	// before the read-only UI snapshot opens it.
+	prepareDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return fmt.Errorf("open database for normalization prep: %w", err)
+	}
+	if err := inventory.PrepareLocalMachineDB(ctx, prepareDB, identity); err != nil {
+		prepareDB.Close()
+		return fmt.Errorf("prepare database: %w", err)
+	}
+	if err := inventory.EnsureRelPathNormBackfill(ctx, prepareDB); err != nil {
+		prepareDB.Close()
+		return fmt.Errorf("prepare normalization data: %w", err)
+	}
+	if err := prepareDB.Close(); err != nil {
+		return fmt.Errorf("close normalization prep database: %w", err)
 	}
 	normalizedDB, err := normalizeDBPath(dbPath)
 	if err != nil {

@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"unicode/utf8"
+
+	inventory "sympath"
 )
 
 var ignoredCommonOSBasenames = []string{
@@ -64,6 +66,13 @@ type fileDiffPair struct {
 type fileBrief struct {
 	Size   int64  `json:"size"`
 	SHA256 string `json:"sha256"`
+}
+
+type comparePathEntry struct {
+	RawRelPath     string
+	CompareRelPath string
+	Size           int64
+	SHA256         string
 }
 
 func resolveScanID(ctx context.Context, db *sql.DB, machineID, root string) (int64, error) {
@@ -243,71 +252,105 @@ func findDuplicates(ctx context.Context, db *sql.DB, machineID, root, prefix str
 }
 
 func compareByPath(ctx context.Context, db *sql.DB, leftScan, rightScan int64, leftPrefix, rightPrefix string, ignoreCommonOS bool) (compareResult, error) {
-	cte, args := entryCTEs(leftScan, rightScan, leftPrefix, rightPrefix, ignoreCommonOS)
-	identicalPredicate := identicalByPathPredicate("l", "r")
+	leftEntries, err := loadCompareEntries(ctx, db, leftScan, leftPrefix, ignoreCommonOS)
+	if err != nil {
+		return compareResult{}, fmt.Errorf("load left compare entries: %w", err)
+	}
+	rightEntries, err := loadCompareEntries(ctx, db, rightScan, rightPrefix, ignoreCommonOS)
+	if err != nil {
+		return compareResult{}, fmt.Errorf("load right compare entries: %w", err)
+	}
 
 	var result compareResult
-
-	// Identical count.
-	err := db.QueryRowContext(ctx, cte+fmt.Sprintf(`
-		SELECT COUNT(*) FROM left_entries l
-		JOIN right_entries r ON l.join_path = r.join_path
-		WHERE %s
-	`, identicalPredicate), args...).Scan(&result.IdenticalCount)
-	if err != nil {
-		return compareResult{}, fmt.Errorf("count identical: %w", err)
+	rightByRaw := make(map[string]comparePathEntry, len(rightEntries))
+	for _, entry := range rightEntries {
+		rightByRaw[entry.RawRelPath] = entry
 	}
 
-	// Left-only files.
-	result.LeftOnly, err = queryOnlyFilesCTE(ctx, db, cte, args, "left_entries", "right_entries")
-	if err != nil {
-		return compareResult{}, fmt.Errorf("query left-only: %w", err)
-	}
+	leftMatched := make(map[string]struct{}, len(leftEntries))
+	rightMatched := make(map[string]struct{}, len(rightEntries))
 
-	// Right-only files.
-	result.RightOnly, err = queryOnlyFilesCTE(ctx, db, cte, args, "right_entries", "left_entries")
-	if err != nil {
-		return compareResult{}, fmt.Errorf("query right-only: %w", err)
-	}
-
-	result.LeftOnlyCompact, err = compactMissingTreesCTE(ctx, db, cte, args, result.LeftOnly, "right_entries")
-	if err != nil {
-		return compareResult{}, fmt.Errorf("compact left-only: %w", err)
-	}
-	result.RightOnlyCompact, err = compactMissingTreesCTE(ctx, db, cte, args, result.RightOnly, "left_entries")
-	if err != nil {
-		return compareResult{}, fmt.Errorf("compact right-only: %w", err)
-	}
-
-	// Different files.
-	diffRows, err := db.QueryContext(ctx, cte+fmt.Sprintf(`
-		SELECT l.rel_path,
-		       l.size, COALESCE(l.sha256, ''),
-		       r.size, COALESCE(r.sha256, '')
-		FROM left_entries l
-		JOIN right_entries r ON l.join_path = r.join_path
-		WHERE NOT (%s)
-		ORDER BY l.rel_path
-	`, identicalPredicate), args...)
-	if err != nil {
-		return compareResult{}, fmt.Errorf("query different: %w", err)
-	}
-	defer diffRows.Close()
-
-	for diffRows.Next() {
-		var d fileDiffPair
-		if err := diffRows.Scan(
-			&d.RelPath,
-			&d.Left.Size, &d.Left.SHA256,
-			&d.Right.Size, &d.Right.SHA256,
-		); err != nil {
-			return compareResult{}, err
+	// Phase 1: preserve exact raw-path behavior before any normalization-aware matching.
+	for _, left := range leftEntries {
+		right, ok := rightByRaw[left.RawRelPath]
+		if !ok {
+			continue
 		}
-		result.Different = append(result.Different, d)
+		leftMatched[left.RawRelPath] = struct{}{}
+		rightMatched[right.RawRelPath] = struct{}{}
+		if identicalCompareEntries(left, right) {
+			result.IdenticalCount++
+			continue
+		}
+		result.Different = append(result.Different, fileDiffPair{
+			RelPath: left.RawRelPath,
+			Left:    fileBrief{Size: left.Size, SHA256: left.SHA256},
+			Right:   fileBrief{Size: right.Size, SHA256: right.SHA256},
+		})
 	}
-	if err := diffRows.Err(); err != nil {
-		return compareResult{}, err
+
+	leftFallbackGroups := make(map[string][]comparePathEntry)
+	rightFallbackGroups := make(map[string][]comparePathEntry)
+	for _, left := range leftEntries {
+		if _, ok := leftMatched[left.RawRelPath]; ok {
+			continue
+		}
+		leftFallbackGroups[left.CompareRelPath] = append(leftFallbackGroups[left.CompareRelPath], left)
 	}
+	for _, right := range rightEntries {
+		if _, ok := rightMatched[right.RawRelPath]; ok {
+			continue
+		}
+		rightFallbackGroups[right.CompareRelPath] = append(rightFallbackGroups[right.CompareRelPath], right)
+	}
+
+	// Phase 2: only reconcile normalized keys that are unique on both sides.
+	for compareRelPath, leftGroup := range leftFallbackGroups {
+		rightGroup := rightFallbackGroups[compareRelPath]
+		if len(leftGroup) != 1 || len(rightGroup) != 1 {
+			continue
+		}
+		left := leftGroup[0]
+		right := rightGroup[0]
+		leftMatched[left.RawRelPath] = struct{}{}
+		rightMatched[right.RawRelPath] = struct{}{}
+		if identicalCompareEntries(left, right) {
+			result.IdenticalCount++
+			continue
+		}
+		result.Different = append(result.Different, fileDiffPair{
+			RelPath: compareRelPath,
+			Left:    fileBrief{Size: left.Size, SHA256: left.SHA256},
+			Right:   fileBrief{Size: right.Size, SHA256: right.SHA256},
+		})
+	}
+
+	for _, left := range leftEntries {
+		if _, ok := leftMatched[left.RawRelPath]; ok {
+			continue
+		}
+		result.LeftOnly = append(result.LeftOnly, fileEntry{
+			RelPath: left.RawRelPath,
+			Size:    left.Size,
+			SHA256:  left.SHA256,
+		})
+	}
+	for _, right := range rightEntries {
+		if _, ok := rightMatched[right.RawRelPath]; ok {
+			continue
+		}
+		result.RightOnly = append(result.RightOnly, fileEntry{
+			RelPath: right.RawRelPath,
+			Size:    right.Size,
+			SHA256:  right.SHA256,
+		})
+	}
+
+	sort.Slice(result.Different, func(i, j int) bool {
+		return result.Different[i].RelPath < result.Different[j].RelPath
+	})
+	result.LeftOnlyCompact = compactMissingTreesFromEntries(result.LeftOnly, rightEntries)
+	result.RightOnlyCompact = compactMissingTreesFromEntries(result.RightOnly, leftEntries)
 
 	return ensureNonNilSlices(result), nil
 }
@@ -470,6 +513,101 @@ func queryOnlyFilesCTE(ctx context.Context, db *sql.DB, cte string, args []any, 
 		entries = append(entries, e)
 	}
 	return entries, rows.Err()
+}
+
+func loadCompareEntries(ctx context.Context, db *sql.DB, scanID int64, prefix string, ignoreCommonOS bool) ([]comparePathEntry, error) {
+	rawPrefix := normalizePrefix(prefix)
+	comparePrefix := inventory.CompareRelPathKey(rawPrefix)
+	ignoreClause, ignoreArgs := ignoredCommonOSClause(ignoreCommonOS)
+
+	args := []any{scanID}
+	query := `
+		SELECT rel_path, COALESCE(rel_path_norm, rel_path) AS compare_path, size, COALESCE(sha256, '')
+		FROM entries
+		WHERE scan_id = ?
+	`
+	if rawPrefix != "" {
+		query += `
+		  AND rel_path >= ?
+		  AND rel_path < ? || x'FF'
+	`
+		args = append(args, rawPrefix, rawPrefix)
+	}
+	query += ignoreClause + `
+		ORDER BY rel_path
+	`
+	args = append(args, ignoreArgs...)
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []comparePathEntry
+	for rows.Next() {
+		var entry comparePathEntry
+		if err := rows.Scan(&entry.RawRelPath, &entry.CompareRelPath, &entry.Size, &entry.SHA256); err != nil {
+			return nil, err
+		}
+		if rawPrefix != "" {
+			entry.RawRelPath = strings.TrimPrefix(entry.RawRelPath, rawPrefix)
+		}
+		if comparePrefix != "" {
+			entry.CompareRelPath = strings.TrimPrefix(entry.CompareRelPath, comparePrefix)
+		}
+		entries = append(entries, entry)
+	}
+	return entries, rows.Err()
+}
+
+func identicalCompareEntries(left, right comparePathEntry) bool {
+	return left.Size == right.Size &&
+		left.SHA256 != "" &&
+		right.SHA256 != "" &&
+		left.SHA256 == right.SHA256
+}
+
+func compactMissingTreesFromEntries(entries []fileEntry, opposite []comparePathEntry) []fileDisplayEntry {
+	if len(entries) == 0 {
+		return []fileDisplayEntry{}
+	}
+
+	subtreeCounts := countMissingTreeDirs(entries)
+	candidateDirs := collapseCandidateDirs(subtreeCounts)
+	if len(candidateDirs) == 0 {
+		return rawDisplayEntries(entries)
+	}
+
+	return compactMissingTrees(entries, subtreeCounts, blockedDirsFromEntries(opposite, candidateDirs))
+}
+
+func blockedDirsFromEntries(opposite []comparePathEntry, candidateDirs []string) map[string]struct{} {
+	blockedDirs := make(map[string]struct{})
+	if len(candidateDirs) == 0 {
+		return blockedDirs
+	}
+
+	candidateCompareDirs := make(map[string][]string, len(candidateDirs))
+	for _, rawDir := range candidateDirs {
+		compareDir := inventory.CompareRelPathKey(rawDir)
+		candidateCompareDirs[compareDir] = append(candidateCompareDirs[compareDir], rawDir)
+	}
+	for _, entry := range opposite {
+		if rawDirs, ok := candidateCompareDirs[entry.CompareRelPath]; ok {
+			for _, rawDir := range rawDirs {
+				blockedDirs[rawDir] = struct{}{}
+			}
+		}
+		for _, compareDir := range ancestorDirs(entry.CompareRelPath) {
+			if rawDirs, ok := candidateCompareDirs[compareDir]; ok {
+				for _, rawDir := range rawDirs {
+					blockedDirs[rawDir] = struct{}{}
+				}
+			}
+		}
+	}
+	return blockedDirs
 }
 
 func compactMissingTreesCTE(ctx context.Context, db *sql.DB, cte string, args []any, entries []fileEntry, oppositeTable string) ([]fileDisplayEntry, error) {

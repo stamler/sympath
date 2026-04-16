@@ -163,6 +163,12 @@ func runScanWithIO(args []string, stdout, stderr io.Writer) error {
 			_ = exclusiveDBGuard.Close()
 			return fmt.Errorf("prepare database: %w", err)
 		}
+		if err := inventory.EnsureRelPathNormBackfill(ctx, db); err != nil {
+			_ = db.Close()
+			_ = rootLock.Close()
+			_ = exclusiveDBGuard.Close()
+			return fmt.Errorf("prepare normalization data: %w", err)
+		}
 		if err := exclusiveDBGuard.Close(); err != nil {
 			_ = db.Close()
 			_ = rootLock.Close()
@@ -200,6 +206,12 @@ func runScanWithIO(args []string, stdout, stderr io.Writer) error {
 			_ = rootLock.Close()
 			_ = dbGuard.Close()
 			return fmt.Errorf("prepare database: %w", err)
+		}
+		if err := inventory.EnsureRelPathNormBackfill(ctx, db); err != nil {
+			_ = db.Close()
+			_ = rootLock.Close()
+			_ = dbGuard.Close()
+			return fmt.Errorf("prepare normalization data: %w", err)
 		}
 	}
 	defer dbGuard.Close()
