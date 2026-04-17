@@ -17,6 +17,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -206,6 +207,108 @@ func duplicateGroupPaths(group duplicateGroup) []string {
 	return paths
 }
 
+func canonicalizeCompareResult(result compareResult) compareResult {
+	sort.Slice(result.LeftOnly, func(i, j int) bool {
+		if result.LeftOnly[i].RelPath != result.LeftOnly[j].RelPath {
+			return result.LeftOnly[i].RelPath < result.LeftOnly[j].RelPath
+		}
+		if result.LeftOnly[i].Size != result.LeftOnly[j].Size {
+			return result.LeftOnly[i].Size < result.LeftOnly[j].Size
+		}
+		return result.LeftOnly[i].SHA256 < result.LeftOnly[j].SHA256
+	})
+	sort.Slice(result.RightOnly, func(i, j int) bool {
+		if result.RightOnly[i].RelPath != result.RightOnly[j].RelPath {
+			return result.RightOnly[i].RelPath < result.RightOnly[j].RelPath
+		}
+		if result.RightOnly[i].Size != result.RightOnly[j].Size {
+			return result.RightOnly[i].Size < result.RightOnly[j].Size
+		}
+		return result.RightOnly[i].SHA256 < result.RightOnly[j].SHA256
+	})
+	sort.Slice(result.LeftOnlyCompact, func(i, j int) bool {
+		if result.LeftOnlyCompact[i].RelPath != result.LeftOnlyCompact[j].RelPath {
+			return result.LeftOnlyCompact[i].RelPath < result.LeftOnlyCompact[j].RelPath
+		}
+		if result.LeftOnlyCompact[i].Size != result.LeftOnlyCompact[j].Size {
+			return result.LeftOnlyCompact[i].Size < result.LeftOnlyCompact[j].Size
+		}
+		if result.LeftOnlyCompact[i].SHA256 != result.LeftOnlyCompact[j].SHA256 {
+			return result.LeftOnlyCompact[i].SHA256 < result.LeftOnlyCompact[j].SHA256
+		}
+		if result.LeftOnlyCompact[i].FileCount != result.LeftOnlyCompact[j].FileCount {
+			return result.LeftOnlyCompact[i].FileCount < result.LeftOnlyCompact[j].FileCount
+		}
+		return !result.LeftOnlyCompact[i].Collapsed && result.LeftOnlyCompact[j].Collapsed
+	})
+	sort.Slice(result.RightOnlyCompact, func(i, j int) bool {
+		if result.RightOnlyCompact[i].RelPath != result.RightOnlyCompact[j].RelPath {
+			return result.RightOnlyCompact[i].RelPath < result.RightOnlyCompact[j].RelPath
+		}
+		if result.RightOnlyCompact[i].Size != result.RightOnlyCompact[j].Size {
+			return result.RightOnlyCompact[i].Size < result.RightOnlyCompact[j].Size
+		}
+		if result.RightOnlyCompact[i].SHA256 != result.RightOnlyCompact[j].SHA256 {
+			return result.RightOnlyCompact[i].SHA256 < result.RightOnlyCompact[j].SHA256
+		}
+		if result.RightOnlyCompact[i].FileCount != result.RightOnlyCompact[j].FileCount {
+			return result.RightOnlyCompact[i].FileCount < result.RightOnlyCompact[j].FileCount
+		}
+		return !result.RightOnlyCompact[i].Collapsed && result.RightOnlyCompact[j].Collapsed
+	})
+	sort.Slice(result.Different, func(i, j int) bool {
+		if result.Different[i].RelPath != result.Different[j].RelPath {
+			return result.Different[i].RelPath < result.Different[j].RelPath
+		}
+		if result.Different[i].Left.Size != result.Different[j].Left.Size {
+			return result.Different[i].Left.Size < result.Different[j].Left.Size
+		}
+		if result.Different[i].Right.Size != result.Different[j].Right.Size {
+			return result.Different[i].Right.Size < result.Different[j].Right.Size
+		}
+		if result.Different[i].Left.SHA256 != result.Different[j].Left.SHA256 {
+			return result.Different[i].Left.SHA256 < result.Different[j].Left.SHA256
+		}
+		return result.Different[i].Right.SHA256 < result.Different[j].Right.SHA256
+	})
+	return result
+}
+
+func assertCompareStrategiesAgree(t *testing.T, db *sql.DB, leftScan, rightScan int64, leftPrefix, rightPrefix string, ignoreCommonOS bool) {
+	t.Helper()
+
+	ctx := context.Background()
+	inMemory, err := compareByPathInMemory(ctx, db, leftScan, rightScan, leftPrefix, rightPrefix, ignoreCommonOS)
+	if err != nil {
+		t.Fatalf("compareByPathInMemory failed: %v", err)
+	}
+	sqlFirst, err := compareByPathSQLFirst(ctx, db, leftScan, rightScan, leftPrefix, rightPrefix, ignoreCommonOS)
+	if err != nil {
+		t.Fatalf("compareByPathSQLFirst failed: %v", err)
+	}
+	adaptive, err := compareByPath(ctx, db, leftScan, rightScan, leftPrefix, rightPrefix, ignoreCommonOS)
+	if err != nil {
+		t.Fatalf("compareByPath failed: %v", err)
+	}
+
+	if !reflect.DeepEqual(sqlFirst, inMemory) {
+		gotSQLFirst := canonicalizeCompareResult(sqlFirst)
+		want := canonicalizeCompareResult(inMemory)
+		if reflect.DeepEqual(gotSQLFirst, want) {
+			t.Fatalf("SQL-first compare result only matched after canonicalization; output ordering drifted:\n got: %#v\nwant: %#v", sqlFirst, inMemory)
+		}
+		t.Fatalf("SQL-first compare result differed from in-memory baseline:\n got: %#v\nwant: %#v", sqlFirst, inMemory)
+	}
+	if !reflect.DeepEqual(adaptive, inMemory) {
+		gotAdaptive := canonicalizeCompareResult(adaptive)
+		want := canonicalizeCompareResult(inMemory)
+		if reflect.DeepEqual(gotAdaptive, want) {
+			t.Fatalf("adaptive compare result only matched after canonicalization; output ordering drifted:\n got: %#v\nwant: %#v", adaptive, inMemory)
+		}
+		t.Fatalf("adaptive compare result differed from in-memory baseline:\n got: %#v\nwant: %#v", adaptive, inMemory)
+	}
+}
+
 func TestEntryCTEsBranching(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -223,7 +326,7 @@ func TestEntryCTEsBranching(t *testing.T) {
 			ignoreCommonOS: false,
 			wantArgs:       []any{int64(11), int64(22)},
 			wantSQL: []string{
-				"SELECT rel_path AS join_path, rel_path, size, sha256",
+				"SELECT rel_path AS join_path, rel_path, COALESCE(rel_path_norm, rel_path) AS compare_rel_path, size, sha256",
 			},
 			wantNoSQL: []string{
 				"x'FF'",
@@ -235,9 +338,10 @@ func TestEntryCTEsBranching(t *testing.T) {
 			leftPrefix:     "sub",
 			rightPrefix:    "sub",
 			ignoreCommonOS: false,
-			wantArgs:       []any{5, int64(11), "sub/", "sub/", 5, int64(22), "sub/", "sub/"},
+			wantArgs:       []any{5, 5, int64(11), "sub/", "sub/", 5, 5, int64(22), "sub/", "sub/"},
 			wantSQL: []string{
 				"rel_path AS join_path,",
+				"SUBSTR(COALESCE(rel_path_norm, rel_path), ?) AS compare_rel_path,",
 				"rel_path < ? || x'FF'",
 			},
 			wantNoSQL: []string{
@@ -249,9 +353,10 @@ func TestEntryCTEsBranching(t *testing.T) {
 			leftPrefix:     "left",
 			rightPrefix:    "right",
 			ignoreCommonOS: false,
-			wantArgs:       []any{6, 6, int64(11), "left/", "left/", 7, 7, int64(22), "right/", "right/"},
+			wantArgs:       []any{6, 6, 6, int64(11), "left/", "left/", 7, 7, 7, int64(22), "right/", "right/"},
 			wantSQL: []string{
 				"SUBSTR(rel_path, ?) AS join_path",
+				"SUBSTR(COALESCE(rel_path_norm, rel_path), ?) AS compare_rel_path,",
 				"rel_path < ? || x'FF'",
 			},
 		},
@@ -1168,6 +1273,127 @@ func TestHandleCompareWithLiteralGlobPrefix(t *testing.T) {
 	if len(result.LeftOnly) != 0 || len(result.RightOnly) != 0 || len(result.Different) != 0 {
 		t.Fatalf("expected only the literal-prefix match, got left=%d right=%d diff=%d",
 			len(result.LeftOnly), len(result.RightOnly), len(result.Different))
+	}
+}
+
+func TestCompareByPathStrategiesStayEquivalent(t *testing.T) {
+	tests := []struct {
+		name           string
+		leftPrefix     string
+		rightPrefix    string
+		ignoreCommonOS bool
+		mutate         func(t *testing.T, db *sql.DB, leftScan, rightScan int64)
+	}{
+		{
+			name: "whole tree baseline",
+		},
+		{
+			name:        "matching subdirectory prefix",
+			leftPrefix:  "sub",
+			rightPrefix: "sub",
+		},
+		{
+			name:        "different raw prefixes",
+			leftPrefix:  "leftprefix",
+			rightPrefix: "rightprefix",
+			mutate: func(t *testing.T, db *sql.DB, leftScan, rightScan int64) {
+				insertUITestEntry(t, db, leftScan, "leftprefix/shared.txt", 111, "shared-hash")
+				insertUITestEntry(t, db, rightScan, "rightprefix/shared.txt", 111, "shared-hash")
+				insertUITestEntry(t, db, leftScan, "leftprefix/different.txt", 222, "left-diff")
+				insertUITestEntry(t, db, rightScan, "rightprefix/different.txt", 333, "right-diff")
+				insertUITestEntry(t, db, leftScan, "leftprefix/left-only.txt", 444, "left-only")
+				insertUITestEntry(t, db, rightScan, "rightprefix/right-only.txt", 555, "right-only")
+			},
+		},
+		{
+			name:        "unicode-normalized prefix remap with identical file",
+			leftPrefix:  "albums/La Vie de re\u0302ve",
+			rightPrefix: "albums/La Vie de rêve",
+			mutate: func(t *testing.T, db *sql.DB, leftScan, rightScan int64) {
+				insertUITestEntry(t, db, leftScan, "albums/La Vie de re\u0302ve/shared.flac", 111, "shared-hash")
+				insertUITestEntry(t, db, rightScan, "albums/La Vie de rêve/shared.flac", 111, "shared-hash")
+			},
+		},
+		{
+			name:        "unicode-normalized prefix remap with diff file",
+			leftPrefix:  "albums/La Vie de re\u0302ve",
+			rightPrefix: "albums/La Vie de rêve",
+			mutate: func(t *testing.T, db *sql.DB, leftScan, rightScan int64) {
+				insertUITestEntry(t, db, leftScan, "albums/La Vie de re\u0302ve/different.flac", 111, "left-hash")
+				insertUITestEntry(t, db, rightScan, "albums/La Vie de rêve/different.flac", 222, "right-hash")
+			},
+		},
+		{
+			name:        "ambiguous normalization collision stays unmatched",
+			leftPrefix:  "collision",
+			rightPrefix: "collision",
+			mutate: func(t *testing.T, db *sql.DB, leftScan, rightScan int64) {
+				decomposed := "conflict/re\u0302ve.txt"
+				composed := "conflict/rêve.txt"
+				insertUITestEntry(t, db, leftScan, "collision/"+decomposed, 101, "left-decomposed")
+				insertUITestEntry(t, db, leftScan, "collision/"+composed, 202, "shared-composed")
+				insertUITestEntry(t, db, rightScan, "collision/"+composed, 202, "shared-composed")
+			},
+		},
+		{
+			name: "compact subtree collapse",
+			mutate: func(t *testing.T, db *sql.DB, leftScan, rightScan int64) {
+				insertUITestEntry(t, db, leftScan, "missing/a.txt", 101, "missing-a")
+				insertUITestEntry(t, db, leftScan, "missing/deeper/b.txt", 202, "missing-b")
+				insertUITestEntry(t, db, leftScan, "single/only.txt", 303, "single-only")
+			},
+		},
+		{
+			name: "partially matched directory stays expanded",
+			mutate: func(t *testing.T, db *sql.DB, leftScan, rightScan int64) {
+				insertUITestEntry(t, db, leftScan, "mixed/shared.txt", 111, "mixed-shared")
+				insertUITestEntry(t, db, rightScan, "mixed/shared.txt", 111, "mixed-shared")
+				insertUITestEntry(t, db, leftScan, "mixed/only-left-a.txt", 222, "mixed-left-a")
+				insertUITestEntry(t, db, leftScan, "mixed/sub/only-left-b.txt", 333, "mixed-left-b")
+			},
+		},
+		{
+			name: "normalized matched directory stays expanded",
+			mutate: func(t *testing.T, db *sql.DB, leftScan, rightScan int64) {
+				leftDir := "re\u0302ve"
+				rightDir := "rêve"
+				insertUITestEntry(t, db, leftScan, leftDir+"/shared.txt", 111, "norm-shared")
+				insertUITestEntry(t, db, rightScan, rightDir+"/shared.txt", 111, "norm-shared")
+				insertUITestEntry(t, db, leftScan, leftDir+"/only-left-a.txt", 222, "norm-left-a")
+				insertUITestEntry(t, db, leftScan, leftDir+"/sub/only-left-b.txt", 333, "norm-left-b")
+			},
+		},
+		{
+			name: "file-directory conflict stays expanded",
+			mutate: func(t *testing.T, db *sql.DB, leftScan, rightScan int64) {
+				insertUITestEntry(t, db, leftScan, "conflict/one.txt", 101, "conflict-one")
+				insertUITestEntry(t, db, leftScan, "conflict/two.txt", 202, "conflict-two")
+				insertUITestEntry(t, db, rightScan, "conflict", 303, "conflict-file")
+			},
+		},
+		{
+			name:           "ignore common os metadata",
+			ignoreCommonOS: true,
+			mutate: func(t *testing.T, db *sql.DB, leftScan, rightScan int64) {
+				insertUITestEntry(t, db, leftScan, ".DS_Store", 1, "left-ds-store")
+				insertUITestEntry(t, db, rightScan, "THUMBS.DB", 2, "right-thumbs")
+				insertUITestEntry(t, db, leftScan, "Desktop.ini", 3, "left-desktop")
+				insertUITestEntry(t, db, rightScan, "Desktop.ini", 4, "right-desktop")
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupUITestDB(t)
+			leftScan := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+			rightScan := resolveUITestScanID(t, db, "machine-b", "/data/photos")
+			if tc.mutate != nil {
+				tc.mutate(t, db, leftScan, rightScan)
+			}
+
+			assertCompareStrategiesAgree(t, db, leftScan, rightScan, tc.leftPrefix, tc.rightPrefix, tc.ignoreCommonOS)
+		})
 	}
 }
 

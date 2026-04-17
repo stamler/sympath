@@ -1,3 +1,57 @@
+// ui_compare implements the compare and duplicate query layer that powers the
+// UI endpoints in this package.
+//
+// # Executive summary
+//
+// This file answers two related UI questions over the inventory database:
+//
+// 1. "How do these two scanned trees compare?"
+// 2. "Which files inside this scanned tree are duplicates by content?"
+//
+// The compare path is the more involved of the two. It has to preserve several
+// competing goals at once:
+//
+//   - exact raw-path matching should stay fast on large mirrored trees
+//   - Unicode-normalized path matching must still work when raw paths differ only
+//     by normalization
+//   - compact-view directory collapsing must stay semantically correct
+//   - production should avoid known pathological query shapes on low-overlap or
+//     prefix-remapped compares
+//
+// # High-level compare flow
+//
+// 1. Resolve each requested machine/root pair to a concrete scan ID.
+// 2. Choose compare-by-content or compare-by-path.
+// 3. For compare-by-path:
+//   - choose between the in-memory fully materialized path and the SQL-first path
+//     using a benchmark-driven overlap heuristic
+//   - run exact raw-path matching first
+//   - run normalization-aware fallback only on rows that survived the exact
+//     raw-path phase
+//   - compute compact-view rows while preserving blocked-directory semantics
+//
+// 4. Return stable JSON-friendly result slices for the UI.
+//
+// # Why two compare-by-path implementations exist
+//
+// The in-memory implementation is simple and robust: load both filtered trees into
+// Go, do exact raw-path matching, then do normalization-aware fallback. That is
+// still the fastest production choice for some workloads, especially
+// low-overlap and prefix-remapped compares.
+//
+// The SQL-first implementation moves broad exact-path work back into SQLite so
+// exact-heavy mirrored compares do not need to materialize both full trees
+// before classifying obvious matches. It then narrows the in-memory
+// normalization-aware work to the raw-unmatched remainder.
+//
+// The production selector is intentionally conservative. Benchmarks against
+// real copied ~/.sympath data showed that neither strategy dominates across
+// every workload shape, so this file treats strategy selection as part of the
+// compare algorithm rather than an implementation detail.
+//
+// The duplicate path is simpler: it uses SQL grouping by size and sha256 to
+// return duplicate content groups, optionally scoped by prefix and with the
+// same ignore-common-OS filter used by compare.
 package main
 
 import (
@@ -98,6 +152,9 @@ func normalizePrefix(p string) string {
 	return p + "/"
 }
 
+// ignoredCommonOSClause appends the opt-in filter for well-known OS metadata
+// files. It is used only in query shapes where the referenced name column is
+// unambiguous.
 func ignoredCommonOSClause(ignoreCommonOS bool) (string, []any) {
 	if !ignoreCommonOS {
 		return "", nil
@@ -133,12 +190,24 @@ func singleEntryCTE(name string, scanID int64, prefix string, ignoreCommonOS boo
 	return "WITH " + cte, args
 }
 
+// filteredEntriesCTE produces one filtered entry relation used by compare and
+// duplicate queries.
+//
+// Every projected row carries three path views:
+//   - join_path: the path key used for exact raw-path matching
+//   - rel_path: the raw path trimmed relative to the requested prefix
+//   - compare_rel_path: the normalization-aware path trimmed relative to the
+//     normalization-aware form of the requested prefix
+//
+// The split between rel_path and compare_rel_path is deliberate. Prefix
+// trimming must preserve exact raw-path semantics for phase one while also
+// preserving normalization-aware fallback semantics for phase two.
 func filteredEntriesCTE(name string, scanID int64, prefix string, joinOnRawPath, ignoreCommonOS bool) (string, []any) {
 	ignoreClause, ignoreArgs := ignoredCommonOSClause(ignoreCommonOS)
 
 	if prefix == "" {
 		return fmt.Sprintf(`%s AS (
-			SELECT rel_path AS join_path, rel_path, size, sha256
+			SELECT rel_path AS join_path, rel_path, COALESCE(rel_path_norm, rel_path) AS compare_rel_path, size, sha256
 			FROM entries
 			WHERE scan_id = ?
 			%s
@@ -147,7 +216,9 @@ func filteredEntriesCTE(name string, scanID int64, prefix string, joinOnRawPath,
 
 	// SQLite SUBSTR counts characters, not bytes, so this offset must
 	// use rune count to stay aligned with multibyte UTF-8 prefixes.
-	start := utf8.RuneCountInString(prefix) + 1
+	rawStart := utf8.RuneCountInString(prefix) + 1
+	comparePrefix := inventory.CompareRelPathKey(prefix)
+	compareStart := utf8.RuneCountInString(comparePrefix) + 1
 	// SQLite's default BINARY collation compares TEXT byte-wise, so
 	// prefix || x'FF' is an exclusive upper bound for every UTF-8 path
 	// that begins with prefix.
@@ -156,26 +227,89 @@ func filteredEntriesCTE(name string, scanID int64, prefix string, joinOnRawPath,
 			SELECT
 				rel_path AS join_path,
 				SUBSTR(rel_path, ?) AS rel_path,
+				SUBSTR(COALESCE(rel_path_norm, rel_path), ?) AS compare_rel_path,
 				size, sha256
 			FROM entries
 			WHERE scan_id = ?
 			  AND rel_path >= ?
 			  AND rel_path < ? || x'FF'
 			  %s
-		)`, name, ignoreClause), append([]any{start, scanID, prefix, prefix}, ignoreArgs...)
+		)`, name, ignoreClause), append([]any{rawStart, compareStart, scanID, prefix, prefix}, ignoreArgs...)
 	}
 
 	return fmt.Sprintf(`%s AS (
 		SELECT
 			SUBSTR(rel_path, ?) AS join_path,
 			SUBSTR(rel_path, ?) AS rel_path,
+			SUBSTR(COALESCE(rel_path_norm, rel_path), ?) AS compare_rel_path,
 			size, sha256
 		FROM entries
 		WHERE scan_id = ?
 		  AND rel_path >= ?
 		  AND rel_path < ? || x'FF'
 		  %s
-	)`, name, ignoreClause), append([]any{start, start, scanID, prefix, prefix}, ignoreArgs...)
+	)`, name, ignoreClause), append([]any{rawStart, rawStart, compareStart, scanID, prefix, prefix}, ignoreArgs...)
+}
+
+// ignoredCommonOSClauseForAlias is the aliased form of
+// ignoredCommonOSClause. It exists for query shapes that address base tables
+// directly instead of going through left_entries/right_entries CTE names.
+func ignoredCommonOSClauseForAlias(alias string, ignoreCommonOS bool) (string, []any) {
+	if !ignoreCommonOS {
+		return "", nil
+	}
+
+	args := make([]any, 0, len(ignoredCommonOSBasenames))
+	placeholders := make([]string, 0, len(ignoredCommonOSBasenames))
+	for _, name := range ignoredCommonOSBasenames {
+		placeholders = append(placeholders, "?")
+		args = append(args, name)
+	}
+
+	return fmt.Sprintf(" AND LOWER(%s.name) NOT IN (%s)", alias, strings.Join(placeholders, ", ")), args
+}
+
+// filteredEntriesWhereClause mirrors filteredEntriesCTE's filtering rules but
+// returns only the WHERE predicate and its arguments.
+//
+// This helper is used by the remapped-prefix SQL-first path, where joining
+// directly against base-table entries preserves the primary-key lookup on
+// (scan_id, rel_path) better than routing everything through a trimmed join key.
+func filteredEntriesWhereClause(alias string, scanID int64, prefix string, ignoreCommonOS bool) (string, []any) {
+	ignoreClause, ignoreArgs := ignoredCommonOSClauseForAlias(alias, ignoreCommonOS)
+
+	args := []any{scanID}
+	where := fmt.Sprintf("%s.scan_id = ?", alias)
+	if prefix != "" {
+		where += fmt.Sprintf(" AND %s.rel_path >= ? AND %s.rel_path < ? || x'FF'", alias, alias)
+		args = append(args, prefix, prefix)
+	}
+	where += ignoreClause
+	args = append(args, ignoreArgs...)
+	return where, args
+}
+
+// trimmedRawPathSQL returns the SQL expression that trims a base-table rel_path
+// down to the caller-visible raw relative path for the requested prefix.
+func trimmedRawPathSQL(alias, prefix string) string {
+	if prefix == "" {
+		return alias + ".rel_path"
+	}
+	return fmt.Sprintf("SUBSTR(%s.rel_path, %d)", alias, utf8.RuneCountInString(prefix)+1)
+}
+
+// trimmedComparePathSQL returns the SQL expression that trims the
+// normalization-aware compare path relative to the normalization-aware form of
+// the requested prefix.
+//
+// This cannot reuse the raw prefix offset directly because a Unicode-normalized
+// prefix may have a different rune length than the raw prefix.
+func trimmedComparePathSQL(alias, prefix string) string {
+	if prefix == "" {
+		return fmt.Sprintf("COALESCE(%s.rel_path_norm, %s.rel_path)", alias, alias)
+	}
+	comparePrefix := inventory.CompareRelPathKey(prefix)
+	return fmt.Sprintf("SUBSTR(COALESCE(%s.rel_path_norm, %s.rel_path), %d)", alias, alias, utf8.RuneCountInString(comparePrefix)+1)
 }
 
 func compareRoots(ctx context.Context, db *sql.DB, leftMachine, leftRoot, rightMachine, rightRoot, leftPrefix, rightPrefix string, byContent, ignoreCommonOS bool) (compareResult, error) {
@@ -251,7 +385,393 @@ func findDuplicates(ctx context.Context, db *sql.DB, machineID, root, prefix str
 	return ensureNonNilDuplicateGroups(result), nil
 }
 
+// compareByPath chooses between two internal implementations that have the
+// same external semantics but very different performance profiles.
+//
+// The in-memory path is simple and robust: it loads both filtered trees into
+// memory, does exact raw-path matching first, then performs a
+// normalization-aware fallback pass over the remaining rows. That shape is
+// fast when most rows are unmatched or when the caller compares different raw
+// prefixes that only line up after trimming.
+//
+// The SQL-first path moves the exact raw-path work back into SQLite and only
+// materializes the raw-unmatched remainder for normalization-aware matching.
+// Benchmarks on real user inventories showed that this sharply reduces
+// allocations and peak heap growth when two trees are largely exact mirrors,
+// but it can be much slower on low-overlap or prefix-remapped compares.
+//
+// Because neither implementation dominates across every workload, production
+// selects a strategy at runtime using a lightweight overlap probe.
 func compareByPath(ctx context.Context, db *sql.DB, leftScan, rightScan int64, leftPrefix, rightPrefix string, ignoreCommonOS bool) (compareResult, error) {
+	useSQLFirst, err := shouldUseSQLFirstPathCompare(ctx, db, leftScan, rightScan, leftPrefix, rightPrefix, ignoreCommonOS)
+	if err != nil {
+		return compareResult{}, fmt.Errorf("choose compare-by-path strategy: %w", err)
+	}
+	if !useSQLFirst {
+		return compareByPathInMemory(ctx, db, leftScan, rightScan, leftPrefix, rightPrefix, ignoreCommonOS)
+	}
+	return compareByPathSQLFirst(ctx, db, leftScan, rightScan, leftPrefix, rightPrefix, ignoreCommonOS)
+}
+
+// shouldUseSQLFirstPathCompare keeps the SQL-first path on a short leash.
+//
+// The first gate is semantic: if the prefixes do not collapse to the same
+// compare-space prefix, the SQL-first implementation is a poor fit because the
+// raw-path join no longer represents the dominant work. In those cases the
+// fully in-memory matcher is consistently safer.
+//
+// When the compare prefixes do align, we still require high exact raw-path
+// overlap before using SQL-first. The threshold is intentionally conservative:
+// benchmarks showed that SQL-first is worthwhile when the exact raw-path phase
+// handles most rows, but can regress badly when large unmatched sets still need
+// to flow through fallback and compact-view processing.
+func shouldUseSQLFirstPathCompare(ctx context.Context, db *sql.DB, leftScan, rightScan int64, leftPrefix, rightPrefix string, ignoreCommonOS bool) (bool, error) {
+	if normalizePrefix(leftPrefix) != normalizePrefix(rightPrefix) {
+		// Prefix-remapped SQL-first compare is no longer pathological, but the
+		// current benchmarks still favor the in-memory path for production use.
+		return false, nil
+	}
+
+	cte, args := entryCTEs(leftScan, rightScan, leftPrefix, rightPrefix, ignoreCommonOS)
+	leftCount, rightCount, exactMatches, err := queryExactMatchStatsCTE(ctx, db, cte, args)
+	if err != nil {
+		return false, err
+	}
+	smallerSide := min(leftCount, rightCount)
+	if smallerSide == 0 {
+		return true, nil
+	}
+
+	// The SQL-first path pays off when exact raw-path overlap dominates and
+	// normalization fallback only needs to inspect a small remainder.
+	return exactMatches*100 >= smallerSide*80, nil
+}
+
+// queryExactMatchStatsCTE fetches just enough information to decide whether the
+// SQL-first path is likely to pay for itself. We deliberately keep this probe
+// small so the strategy decision does not erase the benefits of the faster
+// implementation on exact-heavy workloads.
+func queryExactMatchStatsCTE(ctx context.Context, db *sql.DB, cte string, args []any) (int, int, int, error) {
+	var leftCount, rightCount, exactMatches int
+	err := db.QueryRowContext(ctx, cte+`
+		SELECT
+			(SELECT COUNT(*) FROM left_entries),
+			(SELECT COUNT(*) FROM right_entries),
+			(SELECT COUNT(*) FROM left_entries l JOIN right_entries r ON l.join_path = r.join_path)
+	`, args...).Scan(&leftCount, &rightCount, &exactMatches)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return leftCount, rightCount, exactMatches, nil
+}
+
+// compareByPathSQLFirst restores the old SQL fast path for exact raw-path
+// matching while preserving the newer normalization-aware correctness fixes.
+//
+// The intent is to let SQLite handle the broad "same raw path" questions:
+// identical count, diff rows, and which rows are unmatched by raw path. Only
+// the unmatched remainder is materialized for the normalization-aware fallback.
+//
+// Compact-view blocking still uses the full filtered opposite tree, not just
+// the unmatched remainder. That detail is important: collapse decisions must
+// reflect whether the opposite side contains anything under a directory after
+// compare semantics are applied, even if those opposite-side rows matched
+// earlier in the raw-path phase.
+func compareByPathSQLFirst(ctx context.Context, db *sql.DB, leftScan, rightScan int64, leftPrefix, rightPrefix string, ignoreCommonOS bool) (compareResult, error) {
+	cte, args := entryCTEs(leftScan, rightScan, leftPrefix, rightPrefix, ignoreCommonOS)
+	lp := normalizePrefix(leftPrefix)
+	rp := normalizePrefix(rightPrefix)
+
+	// Phase 1 stays entirely in SQLite so exact-heavy compares do not pay to
+	// materialize both trees before classifying obvious matches. We stream exact
+	// matches and raw unmatched rows from one query so the SQL-first path does
+	// not pay for repeated full CTE scans.
+	var (
+		result       compareResult
+		leftEntries  []comparePathEntry
+		rightEntries []comparePathEntry
+		err          error
+	)
+	if lp == rp {
+		result, leftEntries, rightEntries, err = queryCompareByPathPhaseOneCTE(ctx, db, cte, args)
+	} else {
+		result, leftEntries, rightEntries, err = queryCompareByPathPhaseOneRemappedPrefixes(ctx, db, leftScan, rightScan, lp, rp, ignoreCommonOS)
+	}
+	if err != nil {
+		return compareResult{}, fmt.Errorf("query compare-by-path phase one: %w", err)
+	}
+
+	// Phase 2 reuses the normalization-aware reconciliation logic, but only for
+	// rows that survived the raw-path phase.
+	leftOnly, rightOnly := reconcileComparePathFallback(&result, leftEntries, rightEntries)
+	sortFileEntriesByRelPath(leftOnly)
+	sortFileEntriesByRelPath(rightOnly)
+	result.LeftOnly = leftOnly
+	result.RightOnly = rightOnly
+
+	result.LeftOnlyCompact, err = compactMissingTreesFromComparePathsCTE(ctx, db, cte, args, result.LeftOnly, "right_entries")
+	if err != nil {
+		return compareResult{}, fmt.Errorf("compact left-only trees: %w", err)
+	}
+	result.RightOnlyCompact, err = compactMissingTreesFromComparePathsCTE(ctx, db, cte, args, result.RightOnly, "left_entries")
+	if err != nil {
+		return compareResult{}, fmt.Errorf("compact right-only trees: %w", err)
+	}
+
+	sort.Slice(result.Different, func(i, j int) bool {
+		return result.Different[i].RelPath < result.Different[j].RelPath
+	})
+
+	return ensureNonNilSlices(result), nil
+}
+
+type comparePhaseOneRow struct {
+	LeftRelPath      sql.NullString
+	LeftComparePath  sql.NullString
+	LeftSize         sql.NullInt64
+	LeftSHA256       string
+	RightRelPath     sql.NullString
+	RightComparePath sql.NullString
+	RightSize        sql.NullInt64
+	RightSHA256      string
+}
+
+// queryCompareByPathPhaseOneCTE performs exact raw-path matching and raw-path
+// unmatched extraction in one streamed pass for the "same raw prefix on both
+// sides" case.
+//
+// This is the simplest SQL-first shape: both sides already agree on the raw
+// relative path key, so SQLite can stream exact matches and anti-join rows
+// without reconstructing full paths.
+func queryCompareByPathPhaseOneCTE(ctx context.Context, db *sql.DB, cte string, args []any) (compareResult, []comparePathEntry, []comparePathEntry, error) {
+	rows, err := db.QueryContext(ctx, cte+`
+		SELECT
+			l.rel_path,
+			l.compare_rel_path,
+			l.size,
+			COALESCE(l.sha256, ''),
+			r.rel_path,
+			r.compare_rel_path,
+			r.size,
+			COALESCE(r.sha256, '')
+		FROM left_entries l
+		LEFT JOIN right_entries r ON l.join_path = r.join_path
+		UNION ALL
+		SELECT
+			NULL,
+			NULL,
+			NULL,
+			'',
+			r.rel_path,
+			r.compare_rel_path,
+			r.size,
+			COALESCE(r.sha256, '')
+		FROM right_entries r
+		LEFT JOIN left_entries l ON l.join_path = r.join_path
+		WHERE l.join_path IS NULL
+	`, args...)
+	if err != nil {
+		return compareResult{}, nil, nil, err
+	}
+	defer rows.Close()
+
+	var result compareResult
+	var leftEntries []comparePathEntry
+	var rightEntries []comparePathEntry
+	for rows.Next() {
+		var row comparePhaseOneRow
+		if err := rows.Scan(
+			&row.LeftRelPath,
+			&row.LeftComparePath,
+			&row.LeftSize,
+			&row.LeftSHA256,
+			&row.RightRelPath,
+			&row.RightComparePath,
+			&row.RightSize,
+			&row.RightSHA256,
+		); err != nil {
+			return compareResult{}, nil, nil, err
+		}
+
+		switch {
+		case !row.RightRelPath.Valid:
+			leftEntries = append(leftEntries, comparePathEntry{
+				RawRelPath:     row.LeftRelPath.String,
+				CompareRelPath: row.LeftComparePath.String,
+				Size:           row.LeftSize.Int64,
+				SHA256:         row.LeftSHA256,
+			})
+		case !row.LeftRelPath.Valid:
+			rightEntries = append(rightEntries, comparePathEntry{
+				RawRelPath:     row.RightRelPath.String,
+				CompareRelPath: row.RightComparePath.String,
+				Size:           row.RightSize.Int64,
+				SHA256:         row.RightSHA256,
+			})
+		default:
+			left := comparePathEntry{
+				RawRelPath:     row.LeftRelPath.String,
+				CompareRelPath: row.LeftComparePath.String,
+				Size:           row.LeftSize.Int64,
+				SHA256:         row.LeftSHA256,
+			}
+			right := comparePathEntry{
+				RawRelPath:     row.RightRelPath.String,
+				CompareRelPath: row.RightComparePath.String,
+				Size:           row.RightSize.Int64,
+				SHA256:         row.RightSHA256,
+			}
+			if identicalCompareEntries(left, right) {
+				result.IdenticalCount++
+				continue
+			}
+			result.Different = append(result.Different, fileDiffPair{
+				RelPath: left.RawRelPath,
+				Left:    fileBrief{Size: left.Size, SHA256: left.SHA256},
+				Right:   fileBrief{Size: right.Size, SHA256: right.SHA256},
+			})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return compareResult{}, nil, nil, err
+	}
+	return result, leftEntries, rightEntries, nil
+}
+
+// queryCompareByPathPhaseOneRemappedPrefixes handles compares where the left
+// and right prefixes differ after trimming. Instead of joining on a computed
+// trimmed join key, it scans the filtered side and probes the opposite side by
+// reconstructed full raw path, preserving the primary-key lookup on
+// (scan_id, rel_path).
+//
+// This query shape exists because the straightforward "trim both sides and join
+// on join_path" approach benchmarked poorly for prefix-remapped compares. The
+// current production selector still routes those workloads to the in-memory path,
+// but this specialized SQL-first path is retained both as a benchmarked
+// fallback implementation and as a foundation for future tuning.
+func queryCompareByPathPhaseOneRemappedPrefixes(ctx context.Context, db *sql.DB, leftScan, rightScan int64, leftPrefix, rightPrefix string, ignoreCommonOS bool) (compareResult, []comparePathEntry, []comparePathEntry, error) {
+	leftWhere, leftArgs := filteredEntriesWhereClause("l", leftScan, leftPrefix, ignoreCommonOS)
+	rightWhere, rightArgs := filteredEntriesWhereClause("r", rightScan, rightPrefix, ignoreCommonOS)
+	leftRaw := trimmedRawPathSQL("l", leftPrefix)
+	leftCompare := trimmedComparePathSQL("l", leftPrefix)
+	rightRaw := trimmedRawPathSQL("r", rightPrefix)
+	rightCompare := trimmedComparePathSQL("r", rightPrefix)
+
+	query := fmt.Sprintf(`
+		SELECT
+			%s,
+			%s,
+			l.size,
+			COALESCE(l.sha256, ''),
+			CASE WHEN r.rel_path IS NULL THEN NULL ELSE %s END,
+			CASE WHEN r.rel_path IS NULL THEN NULL ELSE %s END,
+			r.size,
+			COALESCE(r.sha256, '')
+		FROM entries l
+		LEFT JOIN entries r
+		  ON r.scan_id = ?
+		 AND r.rel_path = ? || %s
+		WHERE %s
+		UNION ALL
+		SELECT
+			NULL,
+			NULL,
+			NULL,
+			'',
+			%s,
+			%s,
+			r.size,
+			COALESCE(r.sha256, '')
+		FROM entries r
+		LEFT JOIN entries l
+		  ON l.scan_id = ?
+		 AND l.rel_path = ? || %s
+		WHERE %s
+		  AND l.rel_path IS NULL
+	`, leftRaw, leftCompare, rightRaw, rightCompare, leftRaw, leftWhere, rightRaw, rightCompare, rightRaw, rightWhere)
+
+	args := []any{rightScan, rightPrefix}
+	args = append(args, leftArgs...)
+	args = append(args, leftScan, leftPrefix)
+	args = append(args, rightArgs...)
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return compareResult{}, nil, nil, err
+	}
+	defer rows.Close()
+
+	var result compareResult
+	var leftEntries []comparePathEntry
+	var rightEntries []comparePathEntry
+	for rows.Next() {
+		var row comparePhaseOneRow
+		if err := rows.Scan(
+			&row.LeftRelPath,
+			&row.LeftComparePath,
+			&row.LeftSize,
+			&row.LeftSHA256,
+			&row.RightRelPath,
+			&row.RightComparePath,
+			&row.RightSize,
+			&row.RightSHA256,
+		); err != nil {
+			return compareResult{}, nil, nil, err
+		}
+
+		switch {
+		case !row.RightRelPath.Valid:
+			leftEntries = append(leftEntries, comparePathEntry{
+				RawRelPath:     row.LeftRelPath.String,
+				CompareRelPath: row.LeftComparePath.String,
+				Size:           row.LeftSize.Int64,
+				SHA256:         row.LeftSHA256,
+			})
+		case !row.LeftRelPath.Valid:
+			rightEntries = append(rightEntries, comparePathEntry{
+				RawRelPath:     row.RightRelPath.String,
+				CompareRelPath: row.RightComparePath.String,
+				Size:           row.RightSize.Int64,
+				SHA256:         row.RightSHA256,
+			})
+		default:
+			left := comparePathEntry{
+				RawRelPath:     row.LeftRelPath.String,
+				CompareRelPath: row.LeftComparePath.String,
+				Size:           row.LeftSize.Int64,
+				SHA256:         row.LeftSHA256,
+			}
+			right := comparePathEntry{
+				RawRelPath:     row.RightRelPath.String,
+				CompareRelPath: row.RightComparePath.String,
+				Size:           row.RightSize.Int64,
+				SHA256:         row.RightSHA256,
+			}
+			if identicalCompareEntries(left, right) {
+				result.IdenticalCount++
+				continue
+			}
+			result.Different = append(result.Different, fileDiffPair{
+				RelPath: left.RawRelPath,
+				Left:    fileBrief{Size: left.Size, SHA256: left.SHA256},
+				Right:   fileBrief{Size: right.Size, SHA256: right.SHA256},
+			})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return compareResult{}, nil, nil, err
+	}
+	return result, leftEntries, rightEntries, nil
+}
+
+// compareByPathInMemory is the fully materialized implementation retained for
+// workloads where the SQL-first path regressed in benchmarks.
+//
+// Keeping this code path intact is intentional. It serves two purposes:
+// preserving the benchmark baseline that motivated the adaptive strategy, and
+// acting as the faster production fallback when exact raw-path overlap is too
+// low for the SQL-first path to help.
+func compareByPathInMemory(ctx context.Context, db *sql.DB, leftScan, rightScan int64, leftPrefix, rightPrefix string, ignoreCommonOS bool) (compareResult, error) {
 	leftEntries, err := loadCompareEntries(ctx, db, leftScan, leftPrefix, ignoreCommonOS)
 	if err != nil {
 		return compareResult{}, fmt.Errorf("load left compare entries: %w", err)
@@ -261,6 +781,8 @@ func compareByPath(ctx context.Context, db *sql.DB, leftScan, rightScan int64, l
 		return compareResult{}, fmt.Errorf("load right compare entries: %w", err)
 	}
 
+	// The in-memory path keeps the whole working set in memory so later phases can
+	// revisit it freely without more database round-trips.
 	var result compareResult
 	rightByRaw := make(map[string]comparePathEntry, len(rightEntries))
 	for _, entry := range rightEntries {
@@ -355,11 +877,81 @@ func compareByPath(ctx context.Context, db *sql.DB, leftScan, rightScan int64, l
 	return ensureNonNilSlices(result), nil
 }
 
-func identicalByPathPredicate(leftAlias, rightAlias string) string {
-	return fmt.Sprintf(`%[1]s.size = %[2]s.size
-		  AND NULLIF(%[1]s.sha256, '') IS NOT NULL
-		  AND NULLIF(%[2]s.sha256, '') IS NOT NULL
-		  AND %[1]s.sha256 = %[2]s.sha256`, leftAlias, rightAlias)
+// reconcileComparePathFallback performs the normalization-aware second phase
+// shared by both compare strategies.
+//
+// Only compare paths that are unique on both sides are eligible for fallback
+// reconciliation. Ambiguous normalization collisions stay unmatched on purpose:
+// once multiple raw paths collapse to the same compare path, matching them by
+// position would be guesswork and would silently change compare semantics.
+func reconcileComparePathFallback(result *compareResult, leftEntries, rightEntries []comparePathEntry) ([]fileEntry, []fileEntry) {
+	leftFallbackGroups := make(map[string][]comparePathEntry)
+	rightFallbackGroups := make(map[string][]comparePathEntry)
+	for _, left := range leftEntries {
+		leftFallbackGroups[left.CompareRelPath] = append(leftFallbackGroups[left.CompareRelPath], left)
+	}
+	for _, right := range rightEntries {
+		rightFallbackGroups[right.CompareRelPath] = append(rightFallbackGroups[right.CompareRelPath], right)
+	}
+
+	// Phase 2: only reconcile normalized keys that are unique on both sides.
+	leftMatched := make(map[string]struct{}, len(leftEntries))
+	rightMatched := make(map[string]struct{}, len(rightEntries))
+	for compareRelPath, leftGroup := range leftFallbackGroups {
+		rightGroup := rightFallbackGroups[compareRelPath]
+		if len(leftGroup) != 1 || len(rightGroup) != 1 {
+			continue
+		}
+		left := leftGroup[0]
+		right := rightGroup[0]
+		leftMatched[left.RawRelPath] = struct{}{}
+		rightMatched[right.RawRelPath] = struct{}{}
+		if identicalCompareEntries(left, right) {
+			result.IdenticalCount++
+			continue
+		}
+		result.Different = append(result.Different, fileDiffPair{
+			RelPath: compareRelPath,
+			Left:    fileBrief{Size: left.Size, SHA256: left.SHA256},
+			Right:   fileBrief{Size: right.Size, SHA256: right.SHA256},
+		})
+	}
+
+	leftOnly := make([]fileEntry, 0, len(leftEntries))
+	for _, left := range leftEntries {
+		if _, ok := leftMatched[left.RawRelPath]; ok {
+			continue
+		}
+		leftOnly = append(leftOnly, fileEntry{
+			RelPath: left.RawRelPath,
+			Size:    left.Size,
+			SHA256:  left.SHA256,
+		})
+	}
+	rightOnly := make([]fileEntry, 0, len(rightEntries))
+	for _, right := range rightEntries {
+		if _, ok := rightMatched[right.RawRelPath]; ok {
+			continue
+		}
+		rightOnly = append(rightOnly, fileEntry{
+			RelPath: right.RawRelPath,
+			Size:    right.Size,
+			SHA256:  right.SHA256,
+		})
+	}
+	return leftOnly, rightOnly
+}
+
+func sortFileEntriesByRelPath(entries []fileEntry) {
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].RelPath != entries[j].RelPath {
+			return entries[i].RelPath < entries[j].RelPath
+		}
+		if entries[i].Size != entries[j].Size {
+			return entries[i].Size < entries[j].Size
+		}
+		return entries[i].SHA256 < entries[j].SHA256
+	})
 }
 
 // compareByContent matches files by sha256 regardless of path.
@@ -561,6 +1153,11 @@ func loadCompareEntries(ctx context.Context, db *sql.DB, scanID int64, prefix st
 	return entries, rows.Err()
 }
 
+// identicalCompareEntries defines "identical" for path compare mode.
+//
+// Path compare intentionally treats two entries as identical only when both the
+// size and non-empty sha256 match. Missing hashes keep the row in Different so
+// the UI does not silently treat "unknown content" as "same content".
 func identicalCompareEntries(left, right comparePathEntry) bool {
 	return left.Size == right.Size &&
 		left.SHA256 != "" &&
@@ -568,6 +1165,8 @@ func identicalCompareEntries(left, right comparePathEntry) bool {
 		left.SHA256 == right.SHA256
 }
 
+// compactMissingTreesFromEntries is the in-memory compact-view helper that works
+// from already materialized opposite-side compare entries.
 func compactMissingTreesFromEntries(entries []fileEntry, opposite []comparePathEntry) []fileDisplayEntry {
 	if len(entries) == 0 {
 		return []fileDisplayEntry{}
@@ -580,6 +1179,28 @@ func compactMissingTreesFromEntries(entries []fileEntry, opposite []comparePathE
 	}
 
 	return compactMissingTrees(entries, subtreeCounts, blockedDirsFromEntries(opposite, candidateDirs))
+}
+
+// compactMissingTreesFromComparePathsCTE keeps the SQL-first path from paying
+// for expensive subtree-blocking joins by loading only the opposite side's
+// compare paths and resolving blocked directories in Go.
+func compactMissingTreesFromComparePathsCTE(ctx context.Context, db *sql.DB, cte string, args []any, entries []fileEntry, oppositeTable string) ([]fileDisplayEntry, error) {
+	if len(entries) == 0 {
+		return []fileDisplayEntry{}, nil
+	}
+
+	subtreeCounts := countMissingTreeDirs(entries)
+	candidateDirs := collapseCandidateDirs(subtreeCounts)
+	if len(candidateDirs) == 0 {
+		return rawDisplayEntries(entries), nil
+	}
+
+	opposite, err := loadComparePathsCTE(ctx, db, cte, args, oppositeTable)
+	if err != nil {
+		return nil, err
+	}
+
+	return compactMissingTrees(entries, subtreeCounts, blockedDirsFromEntries(opposite, candidateDirs)), nil
 }
 
 func blockedDirsFromEntries(opposite []comparePathEntry, candidateDirs []string) map[string]struct{} {
@@ -610,82 +1231,31 @@ func blockedDirsFromEntries(opposite []comparePathEntry, candidateDirs []string)
 	return blockedDirs
 }
 
-func compactMissingTreesCTE(ctx context.Context, db *sql.DB, cte string, args []any, entries []fileEntry, oppositeTable string) ([]fileDisplayEntry, error) {
-	if len(entries) == 0 {
-		return []fileDisplayEntry{}, nil
-	}
-
-	subtreeCounts := countMissingTreeDirs(entries)
-	candidateDirs := collapseCandidateDirs(subtreeCounts)
-	if len(candidateDirs) == 0 {
-		return rawDisplayEntries(entries), nil
-	}
-
-	blockedDirs, err := queryBlockedDirsCTE(ctx, db, cte, args, oppositeTable, candidateDirs)
+// loadComparePathsCTE loads only compare-space paths from one side of a compare
+// relation. The SQL-first path uses this instead of the older blocked-dir SQL
+// join because benchmarking showed that loading compare paths once and
+// resolving blocked directories in Go was cheaper than repeatedly asking
+// SQLite subtree questions for compact view blocking.
+func loadComparePathsCTE(ctx context.Context, db *sql.DB, cte string, args []any, table string) ([]comparePathEntry, error) {
+	rows, err := db.QueryContext(ctx, cte+`
+		SELECT compare_rel_path
+		FROM `+table+`
+		ORDER BY compare_rel_path
+	`, args...)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
-	return compactMissingTrees(entries, subtreeCounts, blockedDirs), nil
-}
-
-func queryBlockedDirsCTE(ctx context.Context, db *sql.DB, cte string, args []any, table string, candidateDirs []string) (map[string]struct{}, error) {
-	blockedDirs := make(map[string]struct{})
-	if len(candidateDirs) == 0 {
-		return blockedDirs, nil
-	}
-
-	const candidateDirBatchSize = 400
-
-	for start := 0; start < len(candidateDirs); start += candidateDirBatchSize {
-		end := start + candidateDirBatchSize
-		if end > len(candidateDirs) {
-			end = len(candidateDirs)
-		}
-
-		batch := candidateDirs[start:end]
-		values := make([]string, 0, len(batch))
-		queryArgs := append([]any{}, args...)
-		for _, dir := range batch {
-			values = append(values, "(?)")
-			queryArgs = append(queryArgs, dir)
-		}
-
-		query := fmt.Sprintf(cte+`,
-			candidate_dirs(dir) AS (
-				VALUES %s
-			)
-			SELECT DISTINCT c.dir
-			FROM candidate_dirs c
-			JOIN %s o
-			  ON o.rel_path = c.dir
-			  OR (
-				o.rel_path >= c.dir || '/'
-				AND o.rel_path < c.dir || '/' || x'FF'
-			  )
-		`, strings.Join(values, ", "), table)
-
-		rows, err := db.QueryContext(ctx, query, queryArgs...)
-		if err != nil {
+	var entries []comparePathEntry
+	for rows.Next() {
+		var entry comparePathEntry
+		if err := rows.Scan(&entry.CompareRelPath); err != nil {
 			return nil, err
 		}
-
-		for rows.Next() {
-			var dir string
-			if err := rows.Scan(&dir); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			blockedDirs[dir] = struct{}{}
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		rows.Close()
+		entries = append(entries, entry)
 	}
-
-	return blockedDirs, nil
+	return entries, rows.Err()
 }
 
 func compactMissingTrees(entries []fileEntry, subtreeCounts map[string]int, blockedDirs map[string]struct{}) []fileDisplayEntry {
@@ -751,6 +1321,12 @@ func rawDisplayEntries(entries []fileEntry) []fileDisplayEntry {
 	return display
 }
 
+// topmostCollapsibleDir chooses the highest ancestor that may safely collapse a
+// missing entry in compact view.
+//
+// The search walks outward so the UI prefers one coarse subtree row over many
+// smaller nested collapses, unless an ancestor is blocked by opposite-side
+// presence under compare semantics.
 func topmostCollapsibleDir(relPath string, subtreeCounts map[string]int, blockedDirs map[string]struct{}) string {
 	dirs := ancestorDirs(relPath)
 	for i := len(dirs) - 1; i >= 0; i-- {
