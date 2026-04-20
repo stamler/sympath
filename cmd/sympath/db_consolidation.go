@@ -47,7 +47,7 @@ const (
 	remotesStateName     = "remotes.state.json"
 	buildTempPrefix      = ".sympath-build-"
 	fetchTempPrefix      = ".sympath-fetch-"
-	remoteCommandTimeout = 30 * time.Second
+	remoteConnectTimeout = 10 * time.Second
 	unknownHostnameName  = "unknown-host"
 )
 
@@ -706,6 +706,27 @@ func buildRemoteShellCommand(script string) string {
 	return "sh -c " + quotePOSIXShellToken(script)
 }
 
+func remoteConnectTimeoutOption() string {
+	return fmt.Sprintf("ConnectTimeout=%d", int(remoteConnectTimeout/time.Second))
+}
+
+func buildRemoteLookupArgs(target string) []string {
+	return []string{
+		"-o", remoteConnectTimeoutOption(),
+		target,
+		buildRemoteShellCommand(remoteDBLookupScript),
+	}
+}
+
+func buildRemoteCopyArgs(target, remotePath, localPath string) []string {
+	return []string{
+		"-q",
+		"-o", remoteConnectTimeoutOption(),
+		fmt.Sprintf("%s:%s", target, remotePath),
+		localPath,
+	}
+}
+
 func quotePOSIXShellToken(token string) string {
 	return "'" + strings.ReplaceAll(token, "'", `'"'"'`) + "'"
 }
@@ -735,10 +756,10 @@ func formatCommandError(action string, err error, output []byte) error {
 }
 
 func (shellRemoteTransport) LocateRemoteDB(ctx context.Context, target string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, remoteCommandTimeout)
+	ctx, cancel := context.WithTimeout(ctx, remoteConnectTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "ssh", target, buildRemoteShellCommand(remoteDBLookupScript))
+	cmd := exec.CommandContext(ctx, "ssh", buildRemoteLookupArgs(target)...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", formatCommandError("locate remote database via ssh", err, output)
@@ -748,10 +769,7 @@ func (shellRemoteTransport) LocateRemoteDB(ctx context.Context, target string) (
 }
 
 func (shellRemoteTransport) FetchRemoteDB(ctx context.Context, target, remotePath, localPath string) error {
-	ctx, cancel := context.WithTimeout(ctx, remoteCommandTimeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "scp", "-q", fmt.Sprintf("%s:%s", target, remotePath), localPath)
+	cmd := exec.CommandContext(ctx, "scp", buildRemoteCopyArgs(target, remotePath, localPath)...)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return formatCommandError("copy remote database via scp", err, output)
 	}

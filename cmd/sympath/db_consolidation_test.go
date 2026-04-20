@@ -473,6 +473,43 @@ func TestBuildRemoteShellCommand_QuotesScriptForSSH(t *testing.T) {
 	}
 }
 
+func TestBuildRemoteLookupArgs_UsesConnectTimeout(t *testing.T) {
+	got := buildRemoteLookupArgs("remote-a")
+
+	want := []string{
+		"-o", "ConnectTimeout=10",
+		"remote-a",
+		buildRemoteShellCommand(remoteDBLookupScript),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d args, got %d: %#v", len(want), len(got), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("arg %d: expected %q, got %q", i, want[i], got[i])
+		}
+	}
+}
+
+func TestBuildRemoteCopyArgs_UsesConnectTimeoutWithoutExtraFlags(t *testing.T) {
+	got := buildRemoteCopyArgs("remote-a", "/home/dean/.sympath/current.sympath", "/tmp/fetch.sympath")
+
+	want := []string{
+		"-q",
+		"-o", "ConnectTimeout=10",
+		"remote-a:/home/dean/.sympath/current.sympath",
+		"/tmp/fetch.sympath",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d args, got %d: %#v", len(want), len(got), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("arg %d: expected %q, got %q", i, want[i], got[i])
+		}
+	}
+}
+
 func TestParseRemoteDBPath(t *testing.T) {
 	tests := []struct {
 		name    string
