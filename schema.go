@@ -85,6 +85,44 @@ CREATE TABLE IF NOT EXISTS entries (
 
 CREATE INDEX IF NOT EXISTS idx_scans_machine_root_status ON scans(machine_id, root, status);
 CREATE INDEX IF NOT EXISTS idx_entries_scan ON entries(scan_id);
+
+CREATE TABLE IF NOT EXISTS s3_imports (
+    import_id INTEGER PRIMARY KEY,
+    manifest_path TEXT NOT NULL,
+    report_schema TEXT,
+    imported_at INTEGER NOT NULL,
+    buckets INTEGER NOT NULL,
+    rows_total INTEGER NOT NULL,
+    rows_succeeded INTEGER NOT NULL,
+    rows_usable INTEGER NOT NULL,
+    rows_failed INTEGER NOT NULL,
+    rows_unsupported INTEGER NOT NULL,
+    rows_with_size INTEGER NOT NULL DEFAULT 0,
+    rows_folder_markers INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS s3_report_rows (
+    import_id INTEGER NOT NULL,
+    row_index INTEGER NOT NULL,
+    bucket TEXT NOT NULL,
+    object_key TEXT NOT NULL,
+    version_id TEXT,
+    task_status TEXT,
+    error_code TEXT,
+    http_status_code INTEGER,
+    result_message TEXT,
+    etag TEXT,
+    checksum_base64 TEXT,
+    checksum_hex TEXT,
+    checksum_algorithm TEXT,
+    checksum_type TEXT,
+    usable INTEGER NOT NULL,
+    err TEXT,
+    PRIMARY KEY (import_id, row_index),
+    FOREIGN KEY (import_id) REFERENCES s3_imports(import_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_s3_report_rows_bucket_key ON s3_report_rows(bucket, object_key);
 `
 
 // EnsureSchema creates or upgrades the database schema to the current
@@ -111,6 +149,9 @@ func EnsureSchema(ctx context.Context, db *sql.DB, identity MachineIdentity) err
 	if err := ensureEntriesColumns(ctx, db); err != nil {
 		return err
 	}
+	if err := ensureS3ImportColumns(ctx, db); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -128,6 +169,31 @@ func ensureEntriesColumns(ctx context.Context, db *sql.DB) error {
 	}
 	if entryColumns["rel_path_norm"] == "" {
 		if _, err := db.ExecContext(ctx, "ALTER TABLE entries ADD COLUMN rel_path_norm TEXT"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureS3ImportColumns(ctx context.Context, db *sql.DB) error {
+	hasS3Imports, err := tableExists(ctx, db, "s3_imports")
+	if err != nil {
+		return err
+	}
+	if !hasS3Imports {
+		return nil
+	}
+	columns, err := tableColumns(ctx, db, "s3_imports")
+	if err != nil {
+		return err
+	}
+	if columns["rows_with_size"] == "" {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE s3_imports ADD COLUMN rows_with_size INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
+	if columns["rows_folder_markers"] == "" {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE s3_imports ADD COLUMN rows_folder_markers INTEGER NOT NULL DEFAULT 0"); err != nil {
 			return err
 		}
 	}

@@ -80,6 +80,7 @@ Set `VERSION=vX.Y.Z` to embed a specific release version in the binary.
 
 ```sh
 sympath scan /path/to/root
+sympath import-s3-checksum-report /path/to/manifest.json
 sympath ui
 sympath version
 sympath update
@@ -101,6 +102,98 @@ can compare by path or by content, optionally ignore common OS metadata files,
 and, in path mode, collapses fully missing folder trees into compact rows like
 `path/to/folder/* (N files)` by default. That compact view can be toggled off
 in the UI.
+
+## S3
+
+`sympath import-s3-checksum-report` imports a locally downloaded Amazon S3
+Batch Operations Compute checksum completion-report bundle. Pass the report's
+completion `manifest.json`; `sympath` finds the referenced local CSV files,
+stores all report rows, and publishes `s3://bucket` roots using only
+full-object SHA-256 rows for content comparison.
+
+To create the checksum report in S3, first set account-specific values:
+
+```sh
+export AWS_ACCOUNT_ID=123456789012
+export AWS_REGION=ca-central-1
+export S3_BUCKET=example-archive
+export S3_INVENTORY_PREFIX=inventory
+export S3_BATCH_ROLE_ARN=arn:aws:iam::123456789012:role/S3BatchOperationsChecksumRole
+```
+
+Then create an S3 Batch Operations job that computes full-object SHA-256
+checksums and writes both the completion report and generated manifest back to
+the same bucket:
+
+```sh
+aws s3control create-job \
+  --account-id "$AWS_ACCOUNT_ID" \
+  --region "$AWS_REGION" \
+  --confirmation-required \
+  --operation '{"S3ComputeObjectChecksum":{"ChecksumAlgorithm":"SHA256","ChecksumType":"FULL_OBJECT"}}' \
+  --report "{\"Bucket\":\"arn:aws:s3:::$S3_BUCKET\",\"Format\":\"Report_CSV_20180820\",\"Enabled\":true,\"ReportScope\":\"AllTasks\",\"ExpectedBucketOwner\":\"$AWS_ACCOUNT_ID\"}" \
+  --manifest-generator "{\"S3JobManifestGenerator\":{\"ExpectedBucketOwner\":\"$AWS_ACCOUNT_ID\",\"SourceBucket\":\"arn:aws:s3:::$S3_BUCKET\",\"ManifestOutputLocation\":{\"ExpectedManifestBucketOwner\":\"$AWS_ACCOUNT_ID\",\"Bucket\":\"arn:aws:s3:::$S3_BUCKET\",\"ManifestFormat\":\"S3InventoryReport_CSV_20211130\"},\"Filter\":{},\"EnableManifestOutput\":true}}" \
+  --description "Compute SHA256 checksums - $S3_BUCKET" \
+  --priority 10 \
+  --role-arn "$S3_BATCH_ROLE_ARN" \
+  --client-request-token "$(uuidgen)"
+```
+
+Use `--no-confirmation-required` instead of `--confirmation-required` if you
+want the job to start immediately after creation.
+
+After the job completes, download the completion report folder as-is. Keep the
+AWS-created `manifest.json` and referenced `results/*.csv` files together, and
+point `sympath` at that completion report `manifest.json`:
+
+```sh
+sympath import-s3-checksum-report /path/to/checksum-report/manifest.json
+```
+
+S3 report object keys are URL-encoded in AWS CSV output; `sympath` decodes
+them during import before storing paths or matching inventory metadata.
+Zero-byte S3 folder marker objects whose keys end in `/` are preserved in the
+raw S3 report table but skipped from the comparable file inventory, matching
+the local scanner's behavior of indexing regular files rather than directories.
+
+For size-aware comparisons, also create a CSV-format S3 Inventory report with
+the `Size` and `LastModifiedDate` fields enabled:
+
+```sh
+aws s3api put-bucket-inventory-configuration \
+  --bucket "$S3_BUCKET" \
+  --id sympath-size-inventory \
+  --region "$AWS_REGION" \
+  --expected-bucket-owner "$AWS_ACCOUNT_ID" \
+  --inventory-configuration "{\"Destination\":{\"S3BucketDestination\":{\"AccountId\":\"$AWS_ACCOUNT_ID\",\"Bucket\":\"arn:aws:s3:::$S3_BUCKET\",\"Format\":\"CSV\",\"Prefix\":\"$S3_INVENTORY_PREFIX\"}},\"IsEnabled\":true,\"Id\":\"sympath-size-inventory\",\"IncludedObjectVersions\":\"Current\",\"OptionalFields\":[\"Size\",\"LastModifiedDate\"],\"Schedule\":{\"Frequency\":\"Weekly\"}}"
+```
+
+If the inventory destination bucket policy is not already configured, grant S3
+permission to write inventory objects under the chosen prefix:
+
+```sh
+aws s3api put-bucket-policy \
+  --bucket "$S3_BUCKET" \
+  --region "$AWS_REGION" \
+  --expected-bucket-owner "$AWS_ACCOUNT_ID" \
+  --policy "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"AllowS3InventoryDelivery\",\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"s3.amazonaws.com\"},\"Action\":\"s3:PutObject\",\"Resource\":\"arn:aws:s3:::$S3_BUCKET/$S3_INVENTORY_PREFIX/*\",\"Condition\":{\"ArnLike\":{\"aws:SourceArn\":\"arn:aws:s3:::$S3_BUCKET\"},\"StringEquals\":{\"aws:SourceAccount\":\"$AWS_ACCOUNT_ID\",\"s3:x-amz-acl\":\"bucket-owner-full-control\"}}}]}"
+```
+
+The first inventory report can take up to 48 hours to appear. After it lands,
+download the inventory report folder as-is. Keep the AWS-created
+`manifest.json` and referenced `.csv.gz` files together, and pass the inventory
+`manifest.json` to enrich imported S3 entries with object sizes and
+last-modified timestamps:
+
+```sh
+sympath import-s3-checksum-report \
+  --inventory-manifest /path/to/inventory/manifest.json \
+  /path/to/checksum-report/manifest.json
+```
+
+Downloaded S3 Inventory bundles commonly place `manifest.json` in a timestamped
+folder and the referenced `.csv.gz` objects in a sibling `data/` directory. Do
+not flatten or rename the bundle; that layout is supported.
 
 ## Remotes
 

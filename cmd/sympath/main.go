@@ -68,6 +68,8 @@ func runWithIO(args []string, stdout, stderr io.Writer) error {
 		err = runUpdateCheckWithIO(args[1:], stdout, stderr)
 	case "scan":
 		err = runScanWithIO(args[1:], stdout, stderr)
+	case "import-s3-checksum-report":
+		err = runImportS3ChecksumReportWithIO(args[1:], stdout, stderr)
 	case "ui":
 		err = runUIWithIO(args[1:], stdout, stderr)
 	default:
@@ -269,9 +271,141 @@ func runScanWithIO(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
+func runImportS3ChecksumReportWithIO(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("import-s3-checksum-report", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	verbose := fs.Bool("verbose", false, "Print startup database details")
+	inventoryManifest := fs.String("inventory-manifest", "", "Optional local S3 Inventory manifest.json for object sizes and mtimes")
+
+	fs.Usage = func() {
+		printUsage(stderr)
+	}
+
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("import-s3-checksum-report requires one manifest.json path")
+	}
+	manifestPath := fs.Arg(0)
+	logger := newScanLogger(stderr, *verbose)
+
+	ctx, stop := newScanContext()
+	defer stop()
+	stateDir, err := sympathStateDir()
+	if err != nil {
+		return fmt.Errorf("resolve sympath state directory: %w", err)
+	}
+	if err := ensureSympathDir(stateDir, logger); err != nil {
+		return err
+	}
+	logger.Debugf("Preparing S3 checksum report import for %s", manifestPath)
+	startupLock, err := acquireScanStartupLock(ctx, stateDir)
+	if err != nil {
+		return fmt.Errorf("acquire scan startup lock: %w", err)
+	}
+	startupLockReleased := false
+	defer func() {
+		if !startupLockReleased {
+			_ = startupLock.Close()
+		}
+	}()
+
+	exclusiveDBGuard, exclusiveDBGuardOK, err := tryAcquireScanDBGuardLockExclusive(stateDir)
+	if err != nil {
+		return fmt.Errorf("acquire scan database guard: %w", err)
+	}
+
+	var startup startupState
+	var dbGuard *fileLock
+	var db *sql.DB
+	if exclusiveDBGuardOK {
+		startup, err = resolveRunDBPath(ctx, shellRemoteTransport{}, logger)
+		if err != nil {
+			_ = exclusiveDBGuard.Close()
+			return err
+		}
+		db, err = sql.Open("sqlite", startup.DBPath)
+		if err != nil {
+			_ = exclusiveDBGuard.Close()
+			return fmt.Errorf("open database: %w", err)
+		}
+		if err := inventory.PrepareLocalMachineDB(ctx, db, startup.Identity); err != nil {
+			_ = db.Close()
+			_ = exclusiveDBGuard.Close()
+			return fmt.Errorf("prepare database: %w", err)
+		}
+		if err := inventory.EnsureRelPathNormBackfill(ctx, db); err != nil {
+			_ = db.Close()
+			_ = exclusiveDBGuard.Close()
+			return fmt.Errorf("prepare normalization data: %w", err)
+		}
+		if err := exclusiveDBGuard.Close(); err != nil {
+			_ = db.Close()
+			return fmt.Errorf("release exclusive database guard: %w", err)
+		}
+		dbGuard, err = acquireScanDBGuardLockShared(ctx, stateDir)
+		if err != nil {
+			_ = db.Close()
+			return fmt.Errorf("acquire shared database guard: %w", err)
+		}
+	} else {
+		dbGuard, err = acquireScanDBGuardLockShared(ctx, stateDir)
+		if err != nil {
+			return fmt.Errorf("acquire shared database guard: %w", err)
+		}
+		startup, err = resolveExistingRunDBPath(logger)
+		if err != nil {
+			_ = dbGuard.Close()
+			return err
+		}
+		db, err = sql.Open("sqlite", startup.DBPath)
+		if err != nil {
+			_ = dbGuard.Close()
+			return fmt.Errorf("open database: %w", err)
+		}
+		if err := inventory.PrepareLocalMachineDB(ctx, db, startup.Identity); err != nil {
+			_ = db.Close()
+			_ = dbGuard.Close()
+			return fmt.Errorf("prepare database: %w", err)
+		}
+		if err := inventory.EnsureRelPathNormBackfill(ctx, db); err != nil {
+			_ = db.Close()
+			_ = dbGuard.Close()
+			return fmt.Errorf("prepare normalization data: %w", err)
+		}
+	}
+	defer dbGuard.Close()
+	defer db.Close()
+
+	if err := startupLock.Close(); err != nil {
+		return fmt.Errorf("release scan startup lock: %w", err)
+	}
+	startupLockReleased = true
+
+	summary, err := inventory.ImportS3ChecksumReportManifestWithOptions(ctx, db, manifestPath, inventory.S3ChecksumReportImportOptions{
+		InventoryManifestPath: *inventoryManifest,
+	})
+	if err != nil {
+		return fmt.Errorf("import S3 checksum report: %w", err)
+	}
+
+	normalizedDB, err := normalizeDBPath(startup.DBPath)
+	if err != nil {
+		return fmt.Errorf("normalize database path: %w", err)
+	}
+	logger.Debugf("Using database: %s", normalizedDB)
+	printS3ImportSummary(stdout, normalizedDB, summary)
+	return nil
+}
+
 func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "Usage:\n")
 	fmt.Fprintf(w, "  sympath scan [--verbose] [ROOT]\n")
+	fmt.Fprintf(w, "  sympath import-s3-checksum-report [--verbose] [--inventory-manifest INVENTORY_MANIFEST_JSON] MANIFEST_JSON\n")
 	fmt.Fprintf(w, "  sympath ui\n")
 	fmt.Fprintf(w, "  sympath version\n")
 	fmt.Fprintf(w, "  sympath update\n")
@@ -284,6 +418,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "The ui command consolidates local databases (skipping remote fetch), opens the\n")
 	fmt.Fprintf(w, "chosen database as a read-only best-effort snapshot, then launches a web\n")
 	fmt.Fprintf(w, "interface for comparing inventoried directory trees while later scans may proceed.\n")
+	fmt.Fprintf(w, "Use import-s3-checksum-report to import a locally downloaded S3 Batch Operations completion report bundle.\n")
+	fmt.Fprintf(w, "Add --inventory-manifest to enrich imported S3 entries with Size and LastModifiedDate from a local S3 Inventory CSV bundle.\n")
 	fmt.Fprintf(w, "Use sympath version or sympath --version to print the build version.\n")
 	fmt.Fprintf(w, "Use sympath update to install a newer managed release in place.\n")
 	fmt.Fprintf(w, "Use sympath update-check to force a live release check.\n")
@@ -517,6 +653,29 @@ func printSummary(w io.Writer, root, dbPath string, summary scanSummary) {
 	}
 	sort.Strings(parts)
 	fmt.Fprintf(w, " (%s)\n", strings.Join(parts, ", "))
+}
+
+func printS3ImportSummary(w io.Writer, dbPath string, summary inventory.S3ChecksumReportImportSummary) {
+	fmt.Fprintf(w, "S3 checksum report import complete\n")
+	fmt.Fprintf(w, "Manifest: %s\n", summary.ManifestPath)
+	if summary.InventoryPath != "" {
+		fmt.Fprintf(w, "Inventory: %s\n", summary.InventoryPath)
+	}
+	fmt.Fprintf(w, "DB:       %s\n", dbPath)
+	fmt.Fprintf(w, "Import:   %d\n", summary.ImportID)
+	fmt.Fprintf(w, "Buckets:  %d\n", len(summary.Buckets))
+	fmt.Fprintf(w, "Rows:     total=%d, succeeded=%d, usable_sha256=%d, failed=%d, unsupported=%d\n",
+		summary.RowsTotal, summary.RowsSucceeded, summary.RowsUsable, summary.RowsFailed, summary.RowsUnsupported)
+	if summary.InventoryPath != "" {
+		fmt.Fprintf(w, "Metadata: sized=%d, folder_markers=%d\n", summary.RowsWithSize, summary.RowsFolderMarks)
+	}
+	if len(summary.Buckets) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "Scans:\n")
+	for _, bucket := range summary.Buckets {
+		fmt.Fprintf(w, "  %s scan=%d entries=%d\n", bucket.Root, bucket.ScanID, bucket.Entries)
+	}
 }
 
 func normalizePath(path string) (string, error) {

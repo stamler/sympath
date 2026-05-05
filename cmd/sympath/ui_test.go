@@ -1649,6 +1649,55 @@ func TestHandleCompareByContent(t *testing.T) {
 	}
 }
 
+func TestHandleCompareLocalRootToS3ImportedRoot(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO scans (machine_id, hostname, root, started_at, finished_at, status, fs_type, case_sensitive)
+		VALUES ('machine-s3', 'host-a', 's3://bucket-one', 1000, 2000, 'complete', 's3', 1)
+	`); err != nil {
+		t.Fatal(err)
+	}
+	var s3Scan int64
+	if err := db.QueryRowContext(ctx, "SELECT last_insert_rowid()").Scan(&s3Scan); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO roots (machine_id, root, current_scan_id)
+		VALUES ('machine-s3', 's3://bucket-one', ?)
+	`, s3Scan); err != nil {
+		t.Fatal(err)
+	}
+	insertUITestEntry(t, db, s3Scan, "identical.txt", 100, "aaa111")
+	insertUITestEntry(t, db, s3Scan, "different.txt", 999, "s3-different")
+	insertUITestEntry(t, db, s3Scan, "s3-only.txt", 123, "s3-only")
+
+	req := httptest.NewRequest("GET", "/api/compare?left_machine=machine-a&left_root=/data/photos&right_machine=machine-s3&right_root=s3%3A%2F%2Fbucket-one", nil)
+	rec := httptest.NewRecorder()
+	srv.handleCompare(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result compareResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if result.IdenticalCount != 1 {
+		t.Fatalf("expected 1 identical local/S3 path match, got %d", result.IdenticalCount)
+	}
+	if len(result.Different) != 1 || result.Different[0].RelPath != "different.txt" {
+		t.Fatalf("expected different.txt to be the only different row, got %#v", result.Different)
+	}
+	if !compareHasEntry(result.RightOnly, "s3-only.txt") {
+		t.Fatalf("expected s3-only.txt to be right-only, got %#v", result.RightOnly)
+	}
+}
+
 func TestHandleCompareIncludesMissingHashesAsDifferent(t *testing.T) {
 	db := setupUITestDB(t)
 	srv := &uiServer{db: db}

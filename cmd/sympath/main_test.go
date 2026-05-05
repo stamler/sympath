@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -52,6 +54,12 @@ func TestPrintUsage_DoesNotMentionDBFlag(t *testing.T) {
 	if !strings.Contains(out, "sympath update-check") {
 		t.Fatalf("expected usage to mention update-check command, got:\n%s", out)
 	}
+	if !strings.Contains(out, "sympath import-s3-checksum-report") {
+		t.Fatalf("expected usage to mention S3 checksum report import, got:\n%s", out)
+	}
+	if !strings.Contains(out, "--inventory-manifest") {
+		t.Fatalf("expected usage to mention S3 inventory manifest enrichment, got:\n%s", out)
+	}
 }
 
 func TestRunScan_VerboseReportsDatabaseSetup(t *testing.T) {
@@ -84,6 +92,30 @@ func TestRunScan_VerboseReportsDatabaseSetup(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "Scan complete") {
 		t.Fatalf("expected scan summary on stdout, got:\n%s", stdout.String())
+	}
+}
+
+func TestRunImportS3ChecksumReport_ImportsLocalBundle(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	manifestPath := writeCLIReportBundle(t, t.TempDir())
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := runWithIO([]string{"import-s3-checksum-report", manifestPath}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	out := stdout.String()
+	for _, expected := range []string{
+		"S3 checksum report import complete",
+		"Buckets:  1",
+		"usable_sha256=1",
+		"s3://bucket-one",
+	} {
+		if !strings.Contains(out, expected) {
+			t.Fatalf("expected %q in output, got:\n%s", expected, out)
+		}
 	}
 }
 
@@ -1144,4 +1176,57 @@ func startCrashRecoveryHelper(t *testing.T, root string) (*exec.Cmd, io.WriteClo
 	}
 
 	return cmd, stdin
+}
+
+func writeCLIReportBundle(t *testing.T, dir string) string {
+	t.Helper()
+	reportPath := filepath.Join(dir, "results", "succeeded.csv")
+	if err := os.MkdirAll(filepath.Dir(reportPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Create(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := csv.NewWriter(file)
+	if err := writer.Write([]string{"Bucket", "Key", "VersionId", "TaskStatus", "ErrorCode", "HTTPStatusCode", "ResultMessage"}); err != nil {
+		t.Fatal(err)
+	}
+	resultMessage, err := json.Marshal(map[string]string{
+		"checksumAlgorithm": "SHA256",
+		"checksumType":      "FULL_OBJECT",
+		"checksum_hex":      strings.Repeat("e", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Write([]string{"bucket-one", "photos/a.jpg", "", "succeeded", "", "200", string(resultMessage)}); err != nil {
+		t.Fatal(err)
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	manifestData, err := json.Marshal(map[string]any{
+		"ReportSchema": "Bucket, Key, VersionId, TaskStatus, ErrorCode, HTTPStatusCode, ResultMessage",
+		"Results": []map[string]string{
+			{
+				"TaskExecutionStatus": "succeeded",
+				"Bucket":              "report-bucket",
+				"Key":                 "reports/job/results/succeeded.csv",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(dir, "manifest.json")
+	if err := os.WriteFile(manifestPath, manifestData, 0644); err != nil {
+		t.Fatal(err)
+	}
+	return manifestPath
 }
