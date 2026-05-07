@@ -94,6 +94,33 @@ func TestInstallScript_WarnsWhenRunAsRoot(t *testing.T) {
 	}
 }
 
+func TestInstallScript_HintsWhenExtractedBinaryIsNotExecutable(t *testing.T) {
+	if os.Getenv("RUN_INSTALLER_SMOKE_TESTS") != "1" {
+		t.Skip("set RUN_INSTALLER_SMOKE_TESTS=1 to run installer smoke tests")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX installer test only runs on POSIX hosts")
+	}
+
+	repoRoot := repoRoot(t)
+	assetDir := t.TempDir()
+	assetName := currentPOSIXAssetName(t)
+	binary := []byte("#!/bin/sh\nprintf 'v1.2.3\\n'\n")
+	archivePath := filepath.Join(assetDir, assetName)
+	writeTarGz(t, archivePath, "sympath", binary, 0644)
+	writeChecksums(t, assetDir, archivePath)
+
+	home := t.TempDir()
+	output := runPOSIXInstallerExpectError(t, repoRoot, home, assetDir, nil)
+
+	if !strings.Contains(output, "downloaded archive contained sympath, but it is not executable after extraction") {
+		t.Fatalf("expected executable extraction failure, got:\n%s", output)
+	}
+	if !strings.Contains(output, `TMPDIR="$HOME/.cache" sh`) {
+		t.Fatalf("expected TMPDIR retry hint, got:\n%s", output)
+	}
+}
+
 func TestInstallScript_DoesNotClaimCurrentShellWhenOlderBinaryWins(t *testing.T) {
 	if os.Getenv("RUN_INSTALLER_SMOKE_TESTS") != "1" {
 		t.Skip("set RUN_INSTALLER_SMOKE_TESTS=1 to run installer smoke tests")
@@ -204,6 +231,26 @@ func runPOSIXInstaller(t *testing.T, repoRoot, home, assetDir string, extraEnv [
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("install.sh failed: %v\n%s", err, output)
+	}
+	return string(output)
+}
+
+func runPOSIXInstallerExpectError(t *testing.T, repoRoot, home, assetDir string, extraEnv []string) string {
+	t.Helper()
+
+	cmd := exec.Command("/bin/sh", filepath.Join(repoRoot, "install.sh"))
+	cmd.Dir = repoRoot
+	cmd.Env = append(os.Environ(),
+		"HOME="+home,
+		"PATH="+os.Getenv("PATH"),
+		"SHELL=/bin/zsh",
+		"SYMPATH_INSTALL_BASE_DIR="+assetDir,
+	)
+	cmd.Env = append(cmd.Env, extraEnv...)
+
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected install.sh to fail, got:\n%s", output)
 	}
 	return string(output)
 }

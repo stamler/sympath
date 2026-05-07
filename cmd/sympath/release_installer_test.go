@@ -148,6 +148,56 @@ func TestReleaseInstallerInstallReleaseChecksumMismatch(t *testing.T) {
 	}
 }
 
+func TestReleaseInstallerInstallReleaseHintsWhenTemporaryBinaryCannotRun(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX install test only runs on POSIX hosts")
+	}
+
+	assetName, err := releaseAssetNameForGOOSArch(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Skip(err.Error())
+	}
+
+	assetDir := t.TempDir()
+	writePosixReleaseFixtureForTest(t, assetDir, assetName, "v1.2.4")
+
+	home := t.TempDir()
+	targetPath, err := managedInstallTargetForGOOS(runtime.GOOS, home, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(targetPath, []byte("#!/bin/sh\nprintf 'old\\n'\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv(installBaseDirEnv, assetDir)
+	installer := releaseInstaller{
+		goos:           runtime.GOOS,
+		goarch:         runtime.GOARCH,
+		homeDir:        func() (string, error) { return home, nil },
+		executablePath: func() (string, error) { return targetPath, nil },
+		localAppData:   func() string { return "" },
+		runVersion: func(context.Context, string) (string, error) {
+			return "", os.ErrPermission
+		},
+	}
+
+	_, err = installer.installRelease(context.Background(), "v1.2.4")
+	if err == nil {
+		t.Fatal("expected temporary binary version probe to fail")
+	}
+	errText := err.Error()
+	if !strings.Contains(errText, "read downloaded binary version") {
+		t.Fatalf("expected version probe failure, got %v", err)
+	}
+	if !strings.Contains(errText, `TMPDIR="$HOME/.cache" sympath update`) {
+		t.Fatalf("expected TMPDIR update hint, got %v", err)
+	}
+}
+
 func TestReleaseInstallerInstallReleasePOSIX(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX install test only runs on POSIX hosts")

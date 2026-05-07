@@ -155,7 +155,7 @@ func (i releaseInstaller) installRelease(ctx context.Context, targetVersion stri
 
 	downloadedVersion, err := i.runVersion(ctx, extractedBinary)
 	if err != nil {
-		return installedRelease{}, fmt.Errorf("read downloaded binary version: %w", err)
+		return installedRelease{}, withTemporaryDirectoryHint(i.goos, fmt.Errorf("read downloaded binary version: %w", err))
 	}
 
 	result := installedRelease{
@@ -268,6 +268,13 @@ func reinstallCommandForGOOS(goos string) string {
 	default:
 		return fmt.Sprintf("curl -fsSL https://raw.githubusercontent.com/%s/main/install.sh | sh", releaseRepoSlug())
 	}
+}
+
+func withTemporaryDirectoryHint(goos string, err error) error {
+	if goos == "windows" {
+		return err
+	}
+	return fmt.Errorf("%w\nIf this is Synology DSM or another system with a restricted temporary directory, retry with:\n  mkdir -p \"$HOME/.cache\"\n  TMPDIR=\"$HOME/.cache\" sympath update", err)
 }
 
 func requestedInstallVersion() string {

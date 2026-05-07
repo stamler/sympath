@@ -10,6 +10,22 @@
 curl -fsSL https://raw.githubusercontent.com/stamler/sympath/main/install.sh | sh
 ```
 
+On Synology DSM, or on other systems where `/tmp` is restricted, the POSIX
+installer may fail with `downloaded archive did not contain a runnable sympath
+binary`. In that case, use a home-backed temporary directory:
+
+```sh
+mkdir -p "$HOME/.cache"
+curl -fsSL https://raw.githubusercontent.com/stamler/sympath/main/install.sh | TMPDIR="$HOME/.cache" sh
+```
+
+After installing, either open a new shell or update the current shell's `PATH`:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+sympath version
+```
+
 ### Windows (amd64)
 
 ```powershell
@@ -17,6 +33,12 @@ irm https://raw.githubusercontent.com/stamler/sympath/main/install.ps1 | iex
 ```
 
 Re-running either installer upgrades `sympath` to the latest GitHub release when a newer version is available. If the current release is already installed, the installer leaves the binary in place and only repairs the PATH setup if needed.
+
+On Synology DSM, use the same home-backed temporary directory when updating:
+
+```sh
+TMPDIR="$HOME/.cache" sympath update
+```
 
 Tagged release builds also cache the latest known GitHub release under `~/.sympath/update-check.json`. Successful `scan`, `ui`, and `version` commands may print a brief stderr-only notice when a newer release is already known, and `sympath update-check` forces a live refresh on demand.
 

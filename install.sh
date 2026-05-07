@@ -18,6 +18,17 @@ die() {
   exit 1
 }
 
+die_extracted_binary_not_runnable() {
+  if [ -e "$extracted_bin" ]; then
+    die "downloaded archive contained sympath, but it is not executable after extraction.
+If this is Synology DSM or another system with a restricted temporary directory, retry with:
+  mkdir -p \"\$HOME/.cache\"
+  curl -fsSL https://raw.githubusercontent.com/${SYMPATH_INSTALL_REPO:-$DEFAULT_REPO}/main/install.sh | TMPDIR=\"\$HOME/.cache\" sh"
+  fi
+
+  die "downloaded archive did not contain a runnable sympath binary"
+}
+
 current_euid() {
   if [ -n "${SYMPATH_INSTALL_TEST_EUID:-}" ]; then
     printf '%s\n' "$SYMPATH_INSTALL_TEST_EUID"
@@ -190,7 +201,7 @@ main() {
   [ "$actual_checksum" = "$expected_checksum" ] || die "checksum verification failed for $asset"
 
   tar -xzf "$archive_path" -C "$extracted_dir"
-  [ -x "$extracted_bin" ] || die "downloaded archive did not contain a runnable sympath binary"
+  [ -x "$extracted_bin" ] || die_extracted_binary_not_runnable
 
   downloaded_version="$("$extracted_bin" version)"
   installed_version=""
