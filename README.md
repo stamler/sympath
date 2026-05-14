@@ -34,7 +34,7 @@ irm https://raw.githubusercontent.com/stamler/sympath/main/install.ps1 | iex
 
 Re-running either installer upgrades `sympath` to the latest GitHub release when a newer version is available. If the current release is already installed, the installer leaves the binary in place and only repairs the PATH setup if needed.
 
-On Synology DSM, use the same home-backed temporary directory when updating:
+On Synology DSM and other systems with a restricted `/tmp`, the installer and updater stage release files in `$HOME/.cache` by default when `TMPDIR` is unset or points at `/tmp`. If you have set `TMPDIR` to another restricted directory, override it with a home-backed path:
 
 ```sh
 TMPDIR="$HOME/.cache" sympath update

@@ -115,11 +115,11 @@ func (i releaseInstaller) installRelease(ctx context.Context, targetVersion stri
 		return installedRelease{}, err
 	}
 
-	tempRoot, err := os.MkdirTemp("", "sympath-update-")
+	tempRoot, cleanupTempRoot, err := i.createTemporaryUpdateDir()
 	if err != nil {
 		return installedRelease{}, fmt.Errorf("create temporary update directory: %w", err)
 	}
-	defer os.RemoveAll(tempRoot)
+	defer cleanupTempRoot()
 
 	archivePath := filepath.Join(tempRoot, assetName)
 	checksumsPath := filepath.Join(tempRoot, "checksums.txt")
@@ -202,6 +202,80 @@ func (i releaseInstaller) verifyManagedInstallTarget() (string, error) {
 	}
 
 	return targetPath, nil
+}
+
+func (i releaseInstaller) createTemporaryUpdateDir() (string, func(), error) {
+	if i.goos == "windows" {
+		tempRoot, err := os.MkdirTemp("", "sympath-update-")
+		if err != nil {
+			return "", nil, err
+		}
+		return tempRoot, func() { _ = os.RemoveAll(tempRoot) }, nil
+	}
+
+	parent, createdParent, err := i.ensureTemporaryUpdateParent()
+	if err != nil {
+		return "", nil, err
+	}
+
+	tempRoot, err := os.MkdirTemp(parent, "sympath-update-")
+	if err != nil {
+		if createdParent {
+			_ = os.Remove(parent)
+		}
+		return "", nil, err
+	}
+
+	cleanup := func() {
+		_ = os.RemoveAll(tempRoot)
+		if createdParent {
+			_ = os.Remove(parent)
+		}
+	}
+	return tempRoot, cleanup, nil
+}
+
+func (i releaseInstaller) ensureTemporaryUpdateParent() (string, bool, error) {
+	parent, err := i.temporaryUpdateParent()
+	if err != nil {
+		return "", false, err
+	}
+
+	info, err := os.Stat(parent)
+	if err == nil {
+		if !info.IsDir() {
+			return "", false, fmt.Errorf("%s exists but is not a directory", parent)
+		}
+		return parent, false, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", false, err
+	}
+	if err := os.MkdirAll(parent, 0755); err != nil {
+		return "", false, err
+	}
+	return parent, true, nil
+}
+
+func (i releaseInstaller) temporaryUpdateParent() (string, error) {
+	tempDir := strings.TrimSpace(os.Getenv("TMPDIR"))
+	if tempDir != "" && !isRestrictedDefaultTempDir(i.goos, tempDir) {
+		return tempDir, nil
+	}
+
+	home, err := i.homeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	return joinPathForGOOS(i.goos, home, ".cache"), nil
+}
+
+func isRestrictedDefaultTempDir(goos, tempDir string) bool {
+	if goos == "windows" {
+		return false
+	}
+	clean := filepath.ToSlash(filepath.Clean(tempDir))
+	return clean == "/tmp" || strings.HasPrefix(clean, "/tmp/")
 }
 
 func (i releaseInstaller) managedInstallTarget() (string, error) {

@@ -72,6 +72,42 @@ func TestManagedInstallTargetForGOOS_DefaultAndOverride(t *testing.T) {
 	}
 }
 
+func TestReleaseInstallerTemporaryUpdateParentAvoidsDefaultTmp(t *testing.T) {
+	home := t.TempDir()
+	installer := releaseInstaller{
+		goos:    "linux",
+		homeDir: func() (string, error) { return home, nil },
+	}
+
+	t.Setenv("TMPDIR", "")
+	got, err := installer.temporaryUpdateParent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != filepath.Join(home, ".cache") {
+		t.Fatalf("expected home cache when TMPDIR is empty, got %q", got)
+	}
+
+	t.Setenv("TMPDIR", "/tmp")
+	got, err = installer.temporaryUpdateParent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != filepath.Join(home, ".cache") {
+		t.Fatalf("expected home cache when TMPDIR is /tmp, got %q", got)
+	}
+
+	customTmp := filepath.Join(t.TempDir(), "tmp")
+	t.Setenv("TMPDIR", customTmp)
+	got, err = installer.temporaryUpdateParent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != customTmp {
+		t.Fatalf("expected custom TMPDIR to be preserved, got %q", got)
+	}
+}
+
 func TestReleaseInstallerVerifyManagedInstallTargetRejectsUnmanagedExecutable(t *testing.T) {
 	home := t.TempDir()
 	targetPath, err := managedInstallTargetForGOOS("linux", home, "", "")
@@ -99,6 +135,51 @@ func TestReleaseInstallerVerifyManagedInstallTargetRejectsUnmanagedExecutable(t 
 	}
 	if !strings.Contains(err.Error(), "supports managed installs") {
 		t.Fatalf("expected managed-install error, got %v", err)
+	}
+}
+
+func TestReleaseInstallerInstallReleaseUsesHomeCacheTempDirAndCleansUp(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX install test only runs on POSIX hosts")
+	}
+
+	assetName, err := releaseAssetNameForGOOSArch(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Skip(err.Error())
+	}
+
+	assetDir := t.TempDir()
+	writePosixReleaseFixtureForTest(t, assetDir, assetName, "v1.2.4")
+
+	home := t.TempDir()
+	targetPath, err := managedInstallTargetForGOOS(runtime.GOOS, home, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(targetPath, []byte("#!/bin/sh\nprintf 'old\\n'\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("TMPDIR", "")
+	t.Setenv(installBaseDirEnv, assetDir)
+	installer := releaseInstaller{
+		goos:           runtime.GOOS,
+		goarch:         runtime.GOARCH,
+		homeDir:        func() (string, error) { return home, nil },
+		executablePath: func() (string, error) { return targetPath, nil },
+		localAppData:   func() string { return "" },
+	}
+
+	if _, err := installer.installRelease(context.Background(), "v1.2.4"); err != nil {
+		t.Fatal(err)
+	}
+
+	cacheDir := filepath.Join(home, ".cache")
+	if _, err := os.Stat(cacheDir); !os.IsNotExist(err) {
+		t.Fatalf("expected temporary cache directory to be removed, got %v", err)
 	}
 }
 

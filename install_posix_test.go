@@ -75,6 +75,54 @@ func TestInstallScript_InstallsAndRepairsShellPath(t *testing.T) {
 	}
 }
 
+func TestInstallScript_UsesHomeCacheTempDirAndCleansUp(t *testing.T) {
+	if os.Getenv("RUN_INSTALLER_SMOKE_TESTS") != "1" {
+		t.Skip("set RUN_INSTALLER_SMOKE_TESTS=1 to run installer smoke tests")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX installer test only runs on POSIX hosts")
+	}
+
+	repoRoot := repoRoot(t)
+	assetDir := t.TempDir()
+	writePosixReleaseFixture(t, assetDir, currentPOSIXAssetName(t), "v1.2.3")
+
+	home := t.TempDir()
+	runPOSIXInstaller(t, repoRoot, home, assetDir, []string{"TMPDIR="})
+
+	cacheDir := filepath.Join(home, ".cache")
+	if _, err := os.Stat(cacheDir); !os.IsNotExist(err) {
+		t.Fatalf("expected temporary cache directory to be removed, got %v", err)
+	}
+}
+
+func TestInstallScript_IgnoresVersionProbeStderrOnSuccess(t *testing.T) {
+	if os.Getenv("RUN_INSTALLER_SMOKE_TESTS") != "1" {
+		t.Skip("set RUN_INSTALLER_SMOKE_TESTS=1 to run installer smoke tests")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX installer test only runs on POSIX hosts")
+	}
+
+	repoRoot := repoRoot(t)
+	assetDir := t.TempDir()
+	assetName := currentPOSIXAssetName(t)
+	binary := []byte("#!/bin/sh\nprintf 'v1.2.3\\n'\nprintf 'update available\\n' >&2\n")
+	archivePath := filepath.Join(assetDir, assetName)
+	writeTarGz(t, archivePath, "sympath", binary, 0755)
+	writeChecksums(t, assetDir, archivePath)
+
+	home := t.TempDir()
+	output := runPOSIXInstaller(t, repoRoot, home, assetDir, []string{"TMPDIR=/tmp"})
+
+	if !strings.Contains(output, "Installed sympath v1.2.3 to ") {
+		t.Fatalf("expected clean installed version, got:\n%s", output)
+	}
+	if strings.Contains(output, "update available") {
+		t.Fatalf("expected version probe stderr to stay out of installer output, got:\n%s", output)
+	}
+}
+
 func TestInstallScript_WarnsWhenRunAsRoot(t *testing.T) {
 	if os.Getenv("RUN_INSTALLER_SMOKE_TESTS") != "1" {
 		t.Skip("set RUN_INSTALLER_SMOKE_TESTS=1 to run installer smoke tests")
@@ -115,6 +163,33 @@ func TestInstallScript_HintsWhenExtractedBinaryIsNotExecutable(t *testing.T) {
 
 	if !strings.Contains(output, "downloaded archive contained sympath, but it is not executable after extraction") {
 		t.Fatalf("expected executable extraction failure, got:\n%s", output)
+	}
+	if !strings.Contains(output, `TMPDIR="$HOME/.cache" sh`) {
+		t.Fatalf("expected TMPDIR retry hint, got:\n%s", output)
+	}
+}
+
+func TestInstallScript_HintsWhenDownloadedBinaryVersionCannotRun(t *testing.T) {
+	if os.Getenv("RUN_INSTALLER_SMOKE_TESTS") != "1" {
+		t.Skip("set RUN_INSTALLER_SMOKE_TESTS=1 to run installer smoke tests")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX installer test only runs on POSIX hosts")
+	}
+
+	repoRoot := repoRoot(t)
+	assetDir := t.TempDir()
+	assetName := currentPOSIXAssetName(t)
+	binary := []byte("#!/bin/sh\nprintf 'permission denied\\n' >&2\nexit 126\n")
+	archivePath := filepath.Join(assetDir, assetName)
+	writeTarGz(t, archivePath, "sympath", binary, 0755)
+	writeChecksums(t, assetDir, archivePath)
+
+	home := t.TempDir()
+	output := runPOSIXInstallerExpectError(t, repoRoot, home, assetDir, []string{"TMPDIR=/tmp"})
+
+	if !strings.Contains(output, "read downloaded binary version") {
+		t.Fatalf("expected version probe failure, got:\n%s", output)
 	}
 	if !strings.Contains(output, `TMPDIR="$HOME/.cache" sh`) {
 		t.Fatalf("expected TMPDIR retry hint, got:\n%s", output)

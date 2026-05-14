@@ -29,6 +29,33 @@ If this is Synology DSM or another system with a restricted temporary directory,
   die "downloaded archive did not contain a runnable sympath binary"
 }
 
+die_downloaded_binary_version_failed() {
+  die "read downloaded binary version: $downloaded_version_error
+If this is Synology DSM or another system with a restricted temporary directory, retry with:
+  mkdir -p \"\$HOME/.cache\"
+  curl -fsSL https://raw.githubusercontent.com/${SYMPATH_INSTALL_REPO:-$DEFAULT_REPO}/main/install.sh | TMPDIR=\"\$HOME/.cache\" sh"
+}
+
+choose_temp_parent() {
+  case "${TMPDIR:-}" in
+    ""|/tmp|/tmp/*)
+      printf '%s\n' "$HOME/.cache"
+      ;;
+    *)
+      printf '%s\n' "$TMPDIR"
+      ;;
+  esac
+}
+
+cleanup_temp() {
+  if [ -n "${tmp_dir:-}" ]; then
+    rm -rf "$tmp_dir"
+  fi
+  if [ "${tmp_parent_created:-0}" = "1" ]; then
+    rmdir "$tmp_parent" 2>/dev/null || true
+  fi
+}
+
 current_euid() {
   if [ -n "${SYMPATH_INSTALL_TEST_EUID:-}" ]; then
     printf '%s\n' "$SYMPATH_INSTALL_TEST_EUID"
@@ -176,13 +203,22 @@ main() {
   install_dir="${SYMPATH_INSTALL_DIR:-$HOME/.local/bin}"
   target_path="$install_dir/sympath"
   profile="$(choose_profile)"
-  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sympath-install.XXXXXX")"
+  tmp_dir=""
+  tmp_parent="$(choose_temp_parent)"
+  tmp_parent_created=0
+
+  trap 'cleanup_temp' EXIT INT TERM HUP
+
+  if [ ! -d "$tmp_parent" ]; then
+    mkdir -p "$tmp_parent"
+    tmp_parent_created=1
+  fi
+
+  tmp_dir="$(mktemp -d "$tmp_parent/sympath-install.XXXXXX")"
   archive_path="$tmp_dir/$asset"
   checksums_path="$tmp_dir/checksums.txt"
   extracted_dir="$tmp_dir/extracted"
   extracted_bin="$extracted_dir/sympath"
-
-  trap 'rm -rf "$tmp_dir"' EXIT INT TERM HUP
 
   if [ "$(current_euid)" = "0" ]; then
     warn "running as root installs sympath only for the root account at $install_dir; it does not create a system-wide install"
@@ -203,7 +239,11 @@ main() {
   tar -xzf "$archive_path" -C "$extracted_dir"
   [ -x "$extracted_bin" ] || die_extracted_binary_not_runnable
 
-  downloaded_version="$("$extracted_bin" version)"
+  downloaded_version_error_path="$tmp_dir/version.stderr"
+  if ! downloaded_version="$(SYMPATH_INTERNAL_NO_UPDATE_NOTICE=1 "$extracted_bin" version 2>"$downloaded_version_error_path")"; then
+    downloaded_version_error="$(cat "$downloaded_version_error_path" 2>/dev/null || true)"
+    die_downloaded_binary_version_failed
+  fi
   installed_version=""
   if [ -x "$target_path" ]; then
     installed_version="$("$target_path" version 2>/dev/null || true)"
