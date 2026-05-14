@@ -84,7 +84,7 @@ func TestReleaseInstallerTemporaryUpdateParentAvoidsDefaultTmp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != filepath.Join(home, ".cache") {
+	if want := joinPathForGOOS("linux", home, ".cache"); got != want {
 		t.Fatalf("expected home cache when TMPDIR is empty, got %q", got)
 	}
 
@@ -93,7 +93,7 @@ func TestReleaseInstallerTemporaryUpdateParentAvoidsDefaultTmp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != filepath.Join(home, ".cache") {
+	if want := joinPathForGOOS("linux", home, ".cache"); got != want {
 		t.Fatalf("expected home cache when TMPDIR is /tmp, got %q", got)
 	}
 
