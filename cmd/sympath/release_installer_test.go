@@ -97,7 +97,7 @@ func TestReleaseInstallerTemporaryUpdateParentAvoidsDefaultTmp(t *testing.T) {
 		t.Fatalf("expected home cache when TMPDIR is /tmp, got %q", got)
 	}
 
-	customTmp := filepath.Join(t.TempDir(), "tmp")
+	customTmp := "/var/tmp/sympath-custom-tmp"
 	t.Setenv("TMPDIR", customTmp)
 	got, err = installer.temporaryUpdateParent()
 	if err != nil {
