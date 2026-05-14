@@ -27,9 +27,23 @@ var newScanContext = func() (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 }
 
-var inventoryScanWithProgress = inventory.InventoryTreeWithProgress
+var inventoryScanWithProgress = inventory.InventoryTreeWithProgressAndOptions
 
 const staleScanAdoptionTimeout = 5 * time.Second
+
+type stringListFlag []string
+
+func (f *stringListFlag) String() string {
+	if f == nil {
+		return ""
+	}
+	return strings.Join(*f, ",")
+}
+
+func (f *stringListFlag) Set(value string) error {
+	*f = append(*f, value)
+	return nil
+}
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -86,6 +100,8 @@ func runScanWithIO(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	verbose := fs.Bool("verbose", false, "Print startup database details")
+	var excludes stringListFlag
+	fs.Var(&excludes, "exclude", "Skip files by exact name, or directory trees by exact name with a trailing slash; repeatable")
 
 	fs.Usage = func() {
 		printUsage(stderr)
@@ -246,7 +262,7 @@ func runScanWithIO(args []string, stdout, stderr io.Writer) error {
 	progress, display := newScanProgressDisplay(logger)
 	display.Start()
 
-	if err := inventoryScanWithProgress(ctx, db, root, progress); err != nil {
+	if err := inventoryScanWithProgress(ctx, db, root, progress, inventory.ScanOptions{Excludes: excludes}); err != nil {
 		if display != nil {
 			display.Stop()
 		}
@@ -404,16 +420,17 @@ func runImportS3ChecksumReportWithIO(args []string, stdout, stderr io.Writer) er
 
 func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "Usage:\n")
-	fmt.Fprintf(w, "  sympath scan [--verbose] [ROOT]\n")
+	fmt.Fprintf(w, "  sympath scan [--verbose] [--exclude PATTERN]... [ROOT]\n")
 	fmt.Fprintf(w, "  sympath import-s3-checksum-report [--verbose] [--inventory-manifest INVENTORY_MANIFEST_JSON] MANIFEST_JSON\n")
 	fmt.Fprintf(w, "  sympath ui\n")
 	fmt.Fprintf(w, "  sympath version\n")
 	fmt.Fprintf(w, "  sympath update\n")
 	fmt.Fprintf(w, "  sympath update-check\n")
-	fmt.Fprintf(w, "  sympath [--verbose] [ROOT]\n\n")
+	fmt.Fprintf(w, "  sympath [--verbose] [--exclude PATTERN]... [ROOT]\n\n")
 	fmt.Fprintf(w, "Scans ROOT into the consolidated SQLite inventory database in ~/.sympath.\n")
 	fmt.Fprintf(w, "If ROOT is omitted, the current directory is scanned.\n")
 	fmt.Fprintf(w, "Use --verbose to add debug-level startup and consolidation details.\n")
+	fmt.Fprintf(w, "Use repeated --exclude PATTERN flags to skip exact filenames, or exact directory names with a trailing slash.\n")
 	fmt.Fprintf(w, "On startup, ~/.sympath/remotes is seeded if missing, remotes may be fetched, and ~/.sympath/*.sympath files are consolidated into one file.\n\n")
 	fmt.Fprintf(w, "The ui command consolidates local databases (skipping remote fetch), opens the\n")
 	fmt.Fprintf(w, "chosen database as a read-only best-effort snapshot, then launches a web\n")

@@ -50,6 +50,19 @@ func countEntries(t *testing.T, db *sql.DB, root string) int {
 	return count
 }
 
+func entryExists(t *testing.T, db *sql.DB, root, relPath string) bool {
+	t.Helper()
+	var count int
+	err := db.QueryRow(`
+		SELECT COUNT(*) FROM entries e
+		JOIN roots r ON r.current_scan_id = e.scan_id
+		WHERE r.root = ? AND e.rel_path = ?`, root, relPath).Scan(&count)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return count > 0
+}
+
 func countScans(t *testing.T, db *sql.DB, root string) int {
 	t.Helper()
 	var count int
@@ -785,6 +798,75 @@ func TestInventoryTree_DBFileExcluded(t *testing.T) {
 	// Should only have 1 entry (real.txt), not the DB file
 	if count := countEntries(t, db, absRoot); count != 1 {
 		t.Errorf("expected 1 entry (DB excluded), got %d", count)
+	}
+}
+
+func TestInventoryTreeWithOptions_ExcludesExactFilesAndDirectories(t *testing.T) {
+	dir := t.TempDir()
+	scanDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(filepath.Join(scanDir, "Thumbs.db"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	createTestTree(t, scanDir, map[string]string{
+		"keep.txt":                  "keep",
+		"nested/Thumbs.db":          "excluded file",
+		"case/THUMBS.DB":            "case differs",
+		"nested/myThumbs.db":        "partial differs",
+		"Thumbs.db/inside.txt":      "file pattern does not skip directories",
+		"@eaDir/hidden.txt":         "excluded root subtree",
+		"nested/@eaDir/hidden.txt":  "excluded nested subtree",
+		"nested/@eaDir/deeper/file": "excluded deeper subtree",
+	})
+
+	db := openTestDB(t, dir)
+	ctx := context.Background()
+	absRoot, _ := resolveAbsPath(scanDir)
+
+	if err := InventoryTreeWithOptions(ctx, db, scanDir, ScanOptions{
+		Excludes: []string{"Thumbs.db", "@eaDir/"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, relPath := range []string{
+		"keep.txt",
+		"case/THUMBS.DB",
+		"nested/myThumbs.db",
+		"Thumbs.db/inside.txt",
+	} {
+		if !entryExists(t, db, absRoot, relPath) {
+			t.Fatalf("expected %q to be scanned", relPath)
+		}
+	}
+	for _, relPath := range []string{
+		"nested/Thumbs.db",
+		"@eaDir/hidden.txt",
+		"nested/@eaDir/hidden.txt",
+		"nested/@eaDir/deeper/file",
+	} {
+		if entryExists(t, db, absRoot, relPath) {
+			t.Fatalf("expected %q to be excluded", relPath)
+		}
+	}
+}
+
+func TestInventoryTreeWithOptions_RejectsPathExcludePatterns(t *testing.T) {
+	dir := t.TempDir()
+	scanDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(scanDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	db := openTestDB(t, dir)
+
+	err := InventoryTreeWithOptions(context.Background(), db, scanDir, ScanOptions{
+		Excludes: []string{"nested/Thumbs.db"},
+	})
+	if err == nil {
+		t.Fatal("expected path-like exclude pattern to be rejected")
+	}
+	if !strings.Contains(err.Error(), "must be a single filename") {
+		t.Fatalf("expected single filename error, got %v", err)
 	}
 }
 

@@ -82,3 +82,10 @@ type VolumeInfo struct {
 	FSType        string
 	CaseSensitive bool
 }
+
+// ScanOptions customizes a local inventory scan.
+type ScanOptions struct {
+	// Excludes contains exact filename or directory-name patterns to skip.
+	// Directory patterns must end in "/" and skip the whole matching subtree.
+	Excludes []string
+}

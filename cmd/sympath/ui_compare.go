@@ -74,6 +74,10 @@ var ignoredCommonOSBasenames = []string{
 	".directory",
 }
 
+var ignoredCommonOSDirnames = []string{
+	"@eadir",
+}
+
 type compareResult struct {
 	IdenticalCount   int                `json:"identical_count"`
 	LeftOnly         []fileEntry        `json:"left_only"`
@@ -167,7 +171,21 @@ func ignoredCommonOSClause(ignoreCommonOS bool) (string, []any) {
 		args = append(args, name)
 	}
 
-	return fmt.Sprintf(" AND LOWER(name) NOT IN (%s)", strings.Join(placeholders, ", ")), args
+	clause := fmt.Sprintf(" AND LOWER(name) NOT IN (%s)", strings.Join(placeholders, ", "))
+	dirClause, dirArgs := ignoredCommonOSDirClause("rel_path")
+	return clause + dirClause, append(args, dirArgs...)
+}
+
+func ignoredCommonOSDirClause(relPathExpr string) (string, []any) {
+	args := make([]any, 0, len(ignoredCommonOSDirnames)*2)
+	var clause strings.Builder
+	for _, name := range ignoredCommonOSDirnames {
+		clause.WriteString(fmt.Sprintf(" AND LOWER(%s) NOT LIKE ?", relPathExpr))
+		args = append(args, name+"/%")
+		clause.WriteString(fmt.Sprintf(" AND LOWER(%s) NOT LIKE ?", relPathExpr))
+		args = append(args, "%/"+name+"/%")
+	}
+	return clause.String(), args
 }
 
 // entryCTEs returns the WITH clause and args that produce left_entries
@@ -266,7 +284,9 @@ func ignoredCommonOSClauseForAlias(alias string, ignoreCommonOS bool) (string, [
 		args = append(args, name)
 	}
 
-	return fmt.Sprintf(" AND LOWER(%s.name) NOT IN (%s)", alias, strings.Join(placeholders, ", ")), args
+	clause := fmt.Sprintf(" AND LOWER(%s.name) NOT IN (%s)", alias, strings.Join(placeholders, ", "))
+	dirClause, dirArgs := ignoredCommonOSDirClause(alias + ".rel_path")
+	return clause + dirClause, append(args, dirArgs...)
 }
 
 // filteredEntriesWhereClause mirrors filteredEntriesCTE's filtering rules but

@@ -16,9 +16,16 @@ package inventory
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
 )
+
+type scanExcluder struct {
+	dbPaths map[string]struct{}
+	files   map[string]struct{}
+	dirs    map[string]struct{}
+}
 
 // getDBPath returns the absolute, symlink-resolved file path of the main
 // database by querying PRAGMA database_list. Returns an empty string if
@@ -69,6 +76,72 @@ func makeExcludeSet(dbPath string) map[string]struct{} {
 		dbPath + "-wal": {},
 		dbPath + "-shm": {},
 	}
+}
+
+func newScanExcluder(dbPath string, patterns []string) (*scanExcluder, error) {
+	files, dirs, err := parseUserExcludePatterns(patterns)
+	if err != nil {
+		return nil, err
+	}
+	return &scanExcluder{
+		dbPaths: makeExcludeSet(dbPath),
+		files:   files,
+		dirs:    dirs,
+	}, nil
+}
+
+func parseUserExcludePatterns(patterns []string) (map[string]struct{}, map[string]struct{}, error) {
+	var files map[string]struct{}
+	var dirs map[string]struct{}
+	for _, pattern := range patterns {
+		if pattern == "" {
+			return nil, nil, fmt.Errorf("empty exclude pattern")
+		}
+		if strings.HasSuffix(pattern, "/") {
+			name := strings.TrimRight(pattern, "/")
+			if name == "" {
+				return nil, nil, fmt.Errorf("invalid directory exclude pattern %q", pattern)
+			}
+			if strings.ContainsAny(name, `/\`) {
+				return nil, nil, fmt.Errorf("exclude directory pattern %q must be a single name ending in /", pattern)
+			}
+			if dirs == nil {
+				dirs = make(map[string]struct{})
+			}
+			dirs[name] = struct{}{}
+			continue
+		}
+		if strings.ContainsAny(pattern, `/\`) {
+			return nil, nil, fmt.Errorf("exclude file pattern %q must be a single filename", pattern)
+		}
+		if files == nil {
+			files = make(map[string]struct{})
+		}
+		files[pattern] = struct{}{}
+	}
+	return files, dirs, nil
+}
+
+func (e *scanExcluder) shouldSkipDir(path string) bool {
+	if e == nil || len(e.dirs) == 0 {
+		return false
+	}
+	_, ok := e.dirs[filepath.Base(path)]
+	return ok
+}
+
+func (e *scanExcluder) shouldSkipFile(path, absPath string) bool {
+	if e == nil {
+		return false
+	}
+	if shouldExclude(absPath, e.dbPaths) {
+		return true
+	}
+	if len(e.files) == 0 {
+		return false
+	}
+	_, ok := e.files[filepath.Base(path)]
+	return ok
 }
 
 // shouldExclude checks whether the given absolute path should be excluded

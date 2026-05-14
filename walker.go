@@ -47,7 +47,7 @@ func runWalker(
 	ctx context.Context,
 	root string,
 	reuse *reuseSources,
-	excludeSet map[string]struct{},
+	excluder *scanExcluder,
 	entryCh chan<- baseEntry,
 	jobCh chan<- HashJob,
 	progress *ScanProgress,
@@ -82,8 +82,11 @@ func runWalker(
 			return nil
 		}
 
-		// Skip directories (we recurse into them but don't emit entries)
+		// Skip excluded directories before walking their contents.
 		if d.IsDir() {
+			if excluder.shouldSkipDir(path) {
+				return fs.SkipDir
+			}
 			return nil
 		}
 
@@ -103,9 +106,9 @@ func runWalker(
 			return nil
 		}
 
-		// Skip excluded files (DB + WAL + SHM)
+		// Skip excluded files.
 		absPath, _ := resolveAbsPath(path)
-		if shouldExclude(absPath, excludeSet) {
+		if excluder.shouldSkipFile(path, absPath) {
 			return nil
 		}
 

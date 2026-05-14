@@ -45,6 +45,9 @@ func TestPrintUsage_DoesNotMentionDBFlag(t *testing.T) {
 	if !strings.Contains(out, "--verbose") {
 		t.Fatalf("expected usage to mention --verbose, got:\n%s", out)
 	}
+	if !strings.Contains(out, "--exclude PATTERN") {
+		t.Fatalf("expected usage to mention --exclude, got:\n%s", out)
+	}
 	if !strings.Contains(out, "sympath version") {
 		t.Fatalf("expected usage to mention version command, got:\n%s", out)
 	}
@@ -153,6 +156,52 @@ func TestRunScan_DefaultLogsProgressOnly(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "Scan complete") {
 		t.Fatalf("expected scan summary on stdout, got:\n%s", stdout.String())
+	}
+}
+
+func TestRunScan_ExcludeSkipsFilesAndDirectoryTrees(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(t.TempDir(), "scan-root")
+	t.Setenv("HOME", home)
+
+	createCLITestFile(t, root, "keep.txt", "keep")
+	createCLITestFile(t, root, "nested/Thumbs.db", "excluded")
+	createCLITestFile(t, root, "case/THUMBS.DB", "case differs")
+	createCLITestFile(t, root, "@eaDir/hidden.txt", "excluded")
+	createCLITestFile(t, root, "nested/@eaDir/hidden.txt", "excluded")
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := runScanWithIO([]string{"--exclude", "Thumbs.db", "--exclude", "@eaDir/", root}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	startup, err := resolveExistingRunDBPath(verboseLogger{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", startup.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	normalizedRoot, err := normalizePath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, relPath := range []string{"keep.txt", "case/THUMBS.DB"} {
+		if !cliEntryExists(t, db, normalizedRoot, relPath) {
+			t.Fatalf("expected %q to be scanned", relPath)
+		}
+	}
+	for _, relPath := range []string{"nested/Thumbs.db", "@eaDir/hidden.txt", "nested/@eaDir/hidden.txt"} {
+		if cliEntryExists(t, db, normalizedRoot, relPath) {
+			t.Fatalf("expected %q to be excluded", relPath)
+		}
+	}
+	if !strings.Contains(stdout.String(), "Files: 2") {
+		t.Fatalf("expected scan summary to count only included files, got:\n%s", stdout.String())
 	}
 }
 
@@ -368,7 +417,7 @@ func TestRunScan_UsesInjectedScanContext(t *testing.T) {
 	}
 
 	called := false
-	inventoryScanWithProgress = func(scanCtx context.Context, db *sql.DB, root string, progress *inventory.ScanProgress) error {
+	inventoryScanWithProgress = func(scanCtx context.Context, db *sql.DB, root string, progress *inventory.ScanProgress, options inventory.ScanOptions) error {
 		called = true
 		cancel()
 		<-scanCtx.Done()
@@ -1176,6 +1225,30 @@ func startCrashRecoveryHelper(t *testing.T, root string) (*exec.Cmd, io.WriteClo
 	}
 
 	return cmd, stdin
+}
+
+func createCLITestFile(t *testing.T, root, relPath, content string) {
+	t.Helper()
+	path := filepath.Join(root, filepath.FromSlash(relPath))
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func cliEntryExists(t *testing.T, db *sql.DB, root, relPath string) bool {
+	t.Helper()
+	var count int
+	err := db.QueryRow(`
+		SELECT COUNT(*) FROM entries e
+		JOIN roots r ON r.current_scan_id = e.scan_id
+		WHERE r.root = ? AND e.rel_path = ?`, root, relPath).Scan(&count)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return count > 0
 }
 
 func writeCLIReportBundle(t *testing.T, dir string) string {

@@ -366,11 +366,12 @@ func TestEntryCTEsBranching(t *testing.T) {
 			rightPrefix:    "",
 			ignoreCommonOS: true,
 			wantArgs: []any{
-				int64(11), ".ds_store", "thumbs.db", "ehthumbs.db", "desktop.ini", ".directory",
-				int64(22), ".ds_store", "thumbs.db", "ehthumbs.db", "desktop.ini", ".directory",
+				int64(11), ".ds_store", "thumbs.db", "ehthumbs.db", "desktop.ini", ".directory", "@eadir/%", "%/@eadir/%",
+				int64(22), ".ds_store", "thumbs.db", "ehthumbs.db", "desktop.ini", ".directory", "@eadir/%", "%/@eadir/%",
 			},
 			wantSQL: []string{
 				"LOWER(name) NOT IN (?, ?, ?, ?, ?)",
+				"LOWER(rel_path) NOT LIKE ?",
 			},
 		},
 	}
@@ -1533,6 +1534,45 @@ func TestHandleDuplicatesIgnoreCommonOSFiltersResults(t *testing.T) {
 	}
 }
 
+func TestHandleDuplicatesIgnoreCommonOSFiltersEaDirSubtrees(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	scanID := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	insertUITestEntry(t, db, scanID, "@eaDir/thumb-a.jpg", 10, "eadir-dup")
+	insertUITestEntry(t, db, scanID, "sub/@eaDir/thumb-b.jpg", 10, "eadir-dup")
+
+	req := httptest.NewRequest("GET", "/api/duplicates?machine_id=machine-a&root=/data/photos", nil)
+	rec := httptest.NewRecorder()
+	srv.handleDuplicates(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 without ignore_common_os, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var withMetadata duplicatesResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &withMetadata); err != nil {
+		t.Fatal(err)
+	}
+	if len(withMetadata.Groups) != 1 {
+		t.Fatalf("expected @eaDir duplicates to be included without ignore_common_os, got %#v", withMetadata.Groups)
+	}
+
+	req = httptest.NewRequest("GET", "/api/duplicates?machine_id=machine-a&root=/data/photos&ignore_common_os=1", nil)
+	rec = httptest.NewRecorder()
+	srv.handleDuplicates(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with ignore_common_os, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var filtered duplicatesResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &filtered); err != nil {
+		t.Fatal(err)
+	}
+	if len(filtered.Groups) != 0 {
+		t.Fatalf("expected @eaDir duplicates to be filtered out, got %#v", filtered.Groups)
+	}
+}
+
 func TestHandleDuplicatesIgnoresMissingHashes(t *testing.T) {
 	db := setupUITestDB(t)
 	srv := &uiServer{db: db}
@@ -1852,6 +1892,47 @@ func TestHandleCompareIgnoreCommonOSFiltersPathResults(t *testing.T) {
 	}
 	if compareHasEntry(result.LeftOnly, ".DS_Store") || compareHasEntry(result.RightOnly, "THUMBS.DB") || compareHasDiff(result.Different, "Desktop.ini") {
 		t.Fatalf("expected ignored metadata to be removed, got left=%v right=%v diff=%v", result.LeftOnly, result.RightOnly, result.Different)
+	}
+}
+
+func TestHandleCompareIgnoreCommonOSFiltersEaDirSubtrees(t *testing.T) {
+	db := setupUITestDB(t)
+	srv := &uiServer{db: db}
+
+	leftScan := resolveUITestScanID(t, db, "machine-a", "/data/photos")
+	rightScan := resolveUITestScanID(t, db, "machine-b", "/data/photos")
+
+	insertUITestEntry(t, db, leftScan, "@eaDir/thumb-a.jpg", 10, "left-eadir")
+	insertUITestEntry(t, db, rightScan, "sub/@eaDir/thumb-b.jpg", 20, "right-eadir")
+
+	req := httptest.NewRequest("GET", "/api/compare?left_machine=machine-a&left_root=/data/photos&right_machine=machine-b&right_root=/data/photos", nil)
+	rec := httptest.NewRecorder()
+	srv.handleCompare(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 without ignore_common_os, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var withMetadata compareResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &withMetadata); err != nil {
+		t.Fatal(err)
+	}
+	if !compareHasEntry(withMetadata.LeftOnly, "@eaDir/thumb-a.jpg") || !compareHasEntry(withMetadata.RightOnly, "sub/@eaDir/thumb-b.jpg") {
+		t.Fatalf("expected @eaDir entries without ignore_common_os, got left=%v right=%v", withMetadata.LeftOnly, withMetadata.RightOnly)
+	}
+
+	req = httptest.NewRequest("GET", "/api/compare?left_machine=machine-a&left_root=/data/photos&right_machine=machine-b&right_root=/data/photos&ignore_common_os=1", nil)
+	rec = httptest.NewRecorder()
+	srv.handleCompare(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with ignore_common_os, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var filtered compareResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &filtered); err != nil {
+		t.Fatal(err)
+	}
+	if compareHasEntry(filtered.LeftOnly, "@eaDir/thumb-a.jpg") || compareHasEntry(filtered.RightOnly, "sub/@eaDir/thumb-b.jpg") {
+		t.Fatalf("expected @eaDir entries to be filtered, got left=%v right=%v", filtered.LeftOnly, filtered.RightOnly)
 	}
 }
 

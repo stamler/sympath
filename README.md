@@ -102,6 +102,7 @@ Set `VERSION=vX.Y.Z` to embed a specific release version in the binary.
 
 ```sh
 sympath scan /path/to/root
+sympath scan --exclude Thumbs.db --exclude .DS_Store --exclude @eaDir/ /path/to/root
 sympath import-s3-checksum-report /path/to/manifest.json
 sympath ui
 sympath version
@@ -110,6 +111,13 @@ sympath update-check
 ```
 
 Running `sympath` without a subcommand behaves like `sympath scan`.
+
+By default, scans include every regular file under the root except Sympath's
+own inventory database artifacts. Add repeatable `--exclude` flags to skip
+exact filenames or exact directory names during the scan. A trailing slash marks
+a directory subtree exclude, so `--exclude @eaDir/` skips every directory named
+`@eaDir` and everything below it, while `--exclude Thumbs.db` skips every file
+named exactly `Thumbs.db`.
 
 `sympath version` keeps printing only the build version on stdout. When an update is known to be available, the automatic notice is written to stderr so scripts that read stdout stay stable.
 
@@ -123,7 +131,10 @@ being built.
 can compare by path or by content, optionally ignore common OS metadata files,
 and, in path mode, collapses fully missing folder trees into compact rows like
 `path/to/folder/* (N files)` by default. That compact view can be toggled off
-in the UI.
+in the UI. The UI filter hides common metadata already present in inventories,
+including `.DS_Store`, `Thumbs.db`, `Desktop.ini`, `.directory`, and files under
+`@eaDir/` directories; scan-time `--exclude` prevents matching files from being
+inventoried in the first place.
 
 ## S3
 

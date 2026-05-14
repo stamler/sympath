@@ -59,9 +59,21 @@ func InventoryTree(ctx context.Context, db *sql.DB, root string) error {
 	return InventoryTreeWithProgress(ctx, db, root, nil)
 }
 
+// InventoryTreeWithOptions behaves like [InventoryTree] using scan options.
+func InventoryTreeWithOptions(ctx context.Context, db *sql.DB, root string, options ScanOptions) error {
+	return InventoryTreeWithProgressAndOptions(ctx, db, root, nil, options)
+}
+
 // InventoryTreeWithProgress behaves like [InventoryTree] and also updates
 // progress while the scan is running when progress is non-nil.
 func InventoryTreeWithProgress(ctx context.Context, db *sql.DB, root string, progress *ScanProgress) error {
+	return InventoryTreeWithProgressAndOptions(ctx, db, root, progress, ScanOptions{})
+}
+
+// InventoryTreeWithProgressAndOptions behaves like [InventoryTree] using scan
+// options and also updates progress while the scan is running when progress is
+// non-nil.
+func InventoryTreeWithProgressAndOptions(ctx context.Context, db *sql.DB, root string, progress *ScanProgress, options ScanOptions) error {
 	// Normalize root path
 	absRoot, err := resolveAbsPath(root)
 	if err != nil {
@@ -82,7 +94,10 @@ func InventoryTreeWithProgress(ctx context.Context, db *sql.DB, root string, pro
 	if err != nil {
 		return err
 	}
-	excludeSet := makeExcludeSet(dbPath)
+	excluder, err := newScanExcluder(dbPath, options.Excludes)
+	if err != nil {
+		return err
+	}
 
 	// Load reuse sources for exact-root and overlapping-root reuse.
 	prevEntries, err := loadExactReuseEntries(ctx, db, identity.MachineID, absRoot)
@@ -138,7 +153,7 @@ func InventoryTreeWithProgress(ctx context.Context, db *sql.DB, root string, pro
 
 	// Start walker
 	go func() {
-		walkerErr = runWalker(ctx, absRoot, reuse, excludeSet, entryCh, jobCh, progress)
+		walkerErr = runWalker(ctx, absRoot, reuse, excluder, entryCh, jobCh, progress)
 		progress.noteWalkComplete()
 		close(entryCh)
 		close(jobCh)
